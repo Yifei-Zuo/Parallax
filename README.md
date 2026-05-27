@@ -1,1 +1,1 @@
-# Parallax
+# Parallax: Parameterized Local Linear Attention
