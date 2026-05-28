@@ -59,24 +59,6 @@ from flash_attn.cute import pipeline
 from flash_attn.cute import utils
 
 
-# =============================================================================
-# Inline-PTX helpers for Hopper-precise memory ordering
-# =============================================================================
-# The atomic-last-CTA-wins finalize requires cross-CTA visibility of the
-# workspace partials. cute's high-level abstractions (Tensor stores,
-# nvvm.atomicrmw) default to weak ordering / L1-cacheable accesses that
-# can race on Hopper. We use inline PTX for the three operations on the
-# fast path so we can pick exact cache hints + acq_rel semantics:
-#
-#   * `st.global.cg.f32 [ptr], val`  — partials write: cache-global, bypass L1
-#   * `atom.acq_rel.gpu.global.add.u32 dst, [ptr], 1` — counter inc with
-#     real acq_rel ordering at GPU scope (forms the release/acquire sync
-#     pair across all participating CTAs)
-#   * `ld.global.cg.f32 dst, [ptr]`  — partials read on the merger side:
-#     same cache-global hint so the L2-resident write is fresh-loaded.
-# =============================================================================
-
-
 @cute.jit
 def _atom_acq_rel_gpu_add_u32(counter_ptr: cute.Pointer) -> Int32:
     """`atom.acq_rel.gpu.global.add.u32` — returns OLD pre-increment value.
@@ -1649,19 +1631,6 @@ def parallax_decode_cutedsl_sm90(
     )
     return out
 
-
-# =============================================================================
-# Public dispatcher
-# =============================================================================
-# `parallax_decode(q, r, k, v, qk_scale)` is the user-facing API. It:
-#   * picks a wave-aware split count S over the L (= kv_len) dimension so
-#     the (B, H, S) launch grid saturates the SMs;
-#   * (re)uses a small fp32 HBM workspace for the per-split partials
-#     (m, d_1, d_2, O_1, O_2) and an i32 counter (one entry per (B, H));
-#   * delegates to the inner SM90 kernel above, which produces the bf16/fp16
-#     output in a single launch (atomic-last-CTA-wins fused finalize when
-#     S > 1, register-level direct write when S == 1).
-# =============================================================================
 
 # Wave-aware split-count rounding (the in-kernel merge unrolls over the
 # split dim, so we need a power-of-two count).
