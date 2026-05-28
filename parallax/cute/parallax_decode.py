@@ -59,24 +59,6 @@ from flash_attn.cute import pipeline
 from flash_attn.cute import utils
 
 
-# =============================================================================
-# Inline-PTX helpers for Hopper-precise memory ordering
-# =============================================================================
-# The atomic-last-CTA-wins finalize requires cross-CTA visibility of the
-# workspace partials. cute's high-level abstractions (Tensor stores,
-# nvvm.atomicrmw) default to weak ordering / L1-cacheable accesses that
-# can race on Hopper. We use inline PTX for the three operations on the
-# fast path so we can pick exact cache hints + acq_rel semantics:
-#
-#   * `st.global.cg.f32 [ptr], val`  — partials write: cache-global, bypass L1
-#   * `atom.acq_rel.gpu.global.add.u32 dst, [ptr], 1` — counter inc with
-#     real acq_rel ordering at GPU scope (forms the release/acquire sync
-#     pair across all participating CTAs)
-#   * `ld.global.cg.f32 dst, [ptr]`  — partials read on the merger side:
-#     same cache-global hint so the L2-resident write is fresh-loaded.
-# =============================================================================
-
-
 @cute.jit
 def _atom_acq_rel_gpu_add_u32(counter_ptr: cute.Pointer) -> Int32:
     """`atom.acq_rel.gpu.global.add.u32` — returns OLD pre-increment value.
@@ -136,47 +118,6 @@ def _ld_global_cg_f32(gmem_ptr: cute.Pointer) -> Float32:
         asm_dialect=0,
     )
     return Float32(res)
-
-
-# =============================================================================
-# Variable mapping to Parallax paper, §"Streaming Algorithm" Algorithm 1
-# =============================================================================
-# Code names follow Algorithm 1 directly; this table just spells out the
-# tensor-level locations.
-#
-# Paper variable    | Code variable
-# ------------------+------------------------------------------------------------
-# Q_r               | mQ (kernel arg), partitioned tile sQ inside SMEM
-# R_r               | mR (kernel arg), packed with Q into sQ rows 0/1
-# K (full)          | mK / mK_tma; tile K_c → sK[stage] via TMA
-# V (full)          | mV / mV_tma; tile V_c → sV[stage] via TMA
-# O_r (output)      | mO (kernel arg)
-# L (context len)   | kv_len (constexpr)
-# B_c (col block)   | self.n_block_size == 64
-# s (qk_scale)      | softmax_scale_log2 (log2 base, baked into WGMMA epilogue)
-# ---- per-iteration (Algorithm 1 inner loop variables) ----
-# S_1 = Q_r·K_c^T·s | acc_QR row 0 (WGMMA QK)
-# S_2 = R_r·K_c^T   | acc_QR row 1 (same WGMMA QK; R is in sQ row 1)
-# m (per-tile max)  | m_cur
-# m_r (running max) | m_r
-# α (rescale)       | alpha
-# P_1               | inline output of _row0_online_softmax_and_make_p
-# P_2 = P_1 ⊙ S_2   | written into row 1 of tOrP for the PV WGMMA
-# d_1 (running)     | d1
-# d_2 (running)     | d2
-# O_1 (running)     | row 0 of acc_O (PV WGMMA accumulator)
-# O_2 (running)     | row 1 of acc_O (PV WGMMA accumulator, fed P_2)
-# ---- HBM workspace partials (per split, written before the cross-split merge) ----
-# m   per split     | mWs_m       : (B, H, S)
-# d_1 per split     | mWs_d1      : (B, H, S)
-# d_2 per split     | mWs_d2      : (B, H, S)
-# O_1 per split     | mWs_O1      : (B, H, S, D)
-# O_2 per split     | mWs_O2      : (B, H, S, D)
-# atomic counter    | mWs_counter : (B, H) i32
-# ---- final cancellation (single-CTA direct write, OR last-arriver merge) ----
-# O_r = (1 + d_2/d_1) · O_1/d_1 − O_2/d_1
-#     = O_1/d_1 · (1 + c_norm) − O_2/d_1     with c_norm := d_2/d_1
-# =============================================================================
 
 
 _compile_cache: dict[tuple, Callable] = {}
@@ -1690,19 +1631,6 @@ def parallax_decode_cutedsl_sm90(
     )
     return out
 
-
-# =============================================================================
-# Public dispatcher
-# =============================================================================
-# `parallax_decode(q, r, k, v, qk_scale)` is the user-facing API. It:
-#   * picks a wave-aware split count S over the L (= kv_len) dimension so
-#     the (B, H, S) launch grid saturates the SMs;
-#   * (re)uses a small fp32 HBM workspace for the per-split partials
-#     (m, d_1, d_2, O_1, O_2) and an i32 counter (one entry per (B, H));
-#   * delegates to the inner SM90 kernel above, which produces the bf16/fp16
-#     output in a single launch (atomic-last-CTA-wins fused finalize when
-#     S > 1, register-level direct write when S == 1).
-# =============================================================================
 
 # Wave-aware split-count rounding (the in-kernel merge unrolls over the
 # split dim, so we need a power-of-two count).
