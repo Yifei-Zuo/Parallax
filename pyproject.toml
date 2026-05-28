@@ -7,8 +7,6 @@ name = "parallax"
 version = "0.1.0"
 description = "Parallax kernel package."
 readme = "README.md"
-# Pinned to Python 3.12 to match the nvidia-cutlass-dsl wheel set in install.sh
-# (other minor versions break the cute DSL wheels).
 requires-python = ">=3.12,<3.13"
 license = { file = "LICENSE" }
 authors = [
@@ -16,7 +14,7 @@ authors = [
     { name = "Dhruv Pai" },
     { name = "Zhichen Zeng" },
 ]
-keywords = ["attention", "cutlass", "cute", "hopper", "decode", "transformer"]
+keywords = ["attention", "cutlass", "cute", "decode", "transformer"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -26,14 +24,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Pinned to match install.sh exactly. The SM90 kernel imports
-# ``flash_attn.cute.{hopper_helpers, pipeline, utils}`` from flash_attn 2.8.3
-# and the cute DSL JIT from nvidia-cutlass-dsl 4.1; bumping any of these tends
-# to break either the JIT path or the cute helpers' API surface.
-#
-# torch==2.5.1 needs the cu124 wheel; install it via
-#   ``pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124``
-# or, with uv, the [[tool.uv.index]] block below selects it automatically.
 dependencies = [
     "torch==2.5.1",
     "triton==3.1.0",
@@ -45,11 +35,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
-# psutil is used by the bench harness for host-side process stats.
-# FA2 ships with the main flash_attn==2.8.3 dependency, so the bench
-# only needs psutil here. FA3 (flash_attn_3) is NOT on PyPI — build it
-# from the Dao-AILab/flash-attention `hopper` subdirectory and install
-# with ``--no-build-isolation`` (see install.sh step 6).
 bench = ["psutil", "rich>=13"]
 
 [project.urls]
@@ -61,12 +46,8 @@ include = ["parallax*"]
 exclude = ["scripts*", "assets*"]
 
 [tool.uv]
-# flash_attn's setup.py imports torch at build time, so its build env needs
-# the *same* torch as the runtime env — disable PEP 517 build isolation.
 no-build-isolation-package = ["flash_attn"]
 
-# Pull torch wheels from the official PyTorch CUDA 12.4 index (matching
-# the ``--index-url https://download.pytorch.org/whl/cu124`` line in install.sh).
 [tool.uv.sources]
 torch = { index = "pytorch-cu124" }
 
