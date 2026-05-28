@@ -138,47 +138,6 @@ def _ld_global_cg_f32(gmem_ptr: cute.Pointer) -> Float32:
     return Float32(res)
 
 
-# =============================================================================
-# Variable mapping to Parallax paper, §"Streaming Algorithm" Algorithm 1
-# =============================================================================
-# Code names follow Algorithm 1 directly; this table just spells out the
-# tensor-level locations.
-#
-# Paper variable    | Code variable
-# ------------------+------------------------------------------------------------
-# Q_r               | mQ (kernel arg), partitioned tile sQ inside SMEM
-# R_r               | mR (kernel arg), packed with Q into sQ rows 0/1
-# K (full)          | mK / mK_tma; tile K_c → sK[stage] via TMA
-# V (full)          | mV / mV_tma; tile V_c → sV[stage] via TMA
-# O_r (output)      | mO (kernel arg)
-# L (context len)   | kv_len (constexpr)
-# B_c (col block)   | self.n_block_size == 64
-# s (qk_scale)      | softmax_scale_log2 (log2 base, baked into WGMMA epilogue)
-# ---- per-iteration (Algorithm 1 inner loop variables) ----
-# S_1 = Q_r·K_c^T·s | acc_QR row 0 (WGMMA QK)
-# S_2 = R_r·K_c^T   | acc_QR row 1 (same WGMMA QK; R is in sQ row 1)
-# m (per-tile max)  | m_cur
-# m_r (running max) | m_r
-# α (rescale)       | alpha
-# P_1               | inline output of _row0_online_softmax_and_make_p
-# P_2 = P_1 ⊙ S_2   | written into row 1 of tOrP for the PV WGMMA
-# d_1 (running)     | d1
-# d_2 (running)     | d2
-# O_1 (running)     | row 0 of acc_O (PV WGMMA accumulator)
-# O_2 (running)     | row 1 of acc_O (PV WGMMA accumulator, fed P_2)
-# ---- HBM workspace partials (per split, written before the cross-split merge) ----
-# m   per split     | mWs_m       : (B, H, S)
-# d_1 per split     | mWs_d1      : (B, H, S)
-# d_2 per split     | mWs_d2      : (B, H, S)
-# O_1 per split     | mWs_O1      : (B, H, S, D)
-# O_2 per split     | mWs_O2      : (B, H, S, D)
-# atomic counter    | mWs_counter : (B, H) i32
-# ---- final cancellation (single-CTA direct write, OR last-arriver merge) ----
-# O_r = (1 + d_2/d_1) · O_1/d_1 − O_2/d_1
-#     = O_1/d_1 · (1 + c_norm) − O_2/d_1     with c_norm := d_2/d_1
-# =============================================================================
-
-
 _compile_cache: dict[tuple, Callable] = {}
 _output_cache: dict[tuple, tuple] = {}
 _cute_input_cache: dict[tuple, tuple] = {}
