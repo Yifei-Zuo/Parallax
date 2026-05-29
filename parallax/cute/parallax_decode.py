@@ -4,11 +4,11 @@
 """Parallax decoding kernel on NVIDIA Hopper (SM90).
 
 Persistent split-K, warp-specialized streaming CuTeDSL kernel that
-implements Algorithm 1 of the Parallax paper. The per-tile online
-softmax, the per-tile composite-score state, and the cross-split
-log-sum-exp merge all run inside a single kernel launch via an
-atomic-last-CTA-wins finalize, with no separate reduction-epilogue
-kernel.
+implements Algorithm 1 of the Parallax paper (https://arxiv.org/abs/2605.29157).
+The per-tile online softmax, the per-tile composite-score state,
+and the cross-split log-sum-exp merge all run inside a single kernel
+launch via an atomic-last-CTA-wins finalize, with no separate
+reduction-epilogue kernel.
 
 Warp specialization (one producer warpgroup issuing TMA loads of
 K_c / V_c tiles into shared memory, one consumer warpgroup driving

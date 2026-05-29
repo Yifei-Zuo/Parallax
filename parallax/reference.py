@@ -1,9 +1,9 @@
-"""fp32 PyTorch reference implementation of Parallax attention.
+"""fp32 PyTorch reference implementation of Parallax mechanism.
 
-Implements Algorithm 1 of the Parallax paper in pure PyTorch. Works for both
-training (multi-query causal attention) and decoding (single-query, full-KV)
-— for decoding pass ``q, r`` of shape ``(B, 1, H, D)``; for training pass
-``q, r`` of shape ``(B, Q, H, D)`` with ``Q == L`` and ``causal=True``.
+Implements Algorithm 1 of the Parallax paper (https://arxiv.org/abs/2605.29157) in pure PyTorch.
+Works for both training (multi-query causal attention) and decoding (single-query, full-KV)
+- for decoding pass ``q, r`` of shape ``(B, 1, H, D)``;
+- for training pass ``q, r`` of shape ``(B, Q, H, D)`` with ``Q == L`` and ``causal=True``.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ def parallax_reference(q: torch.Tensor,
                        qk_scale: float,
                        *,
                        causal: bool = True) -> torch.Tensor:
-    """fp32 PyTorch reference for Parallax attention (Algorithm 1).
+    """fp32 PyTorch reference for Parallax (Algorithm 1).
 
     Args:
         q, r: ``(B, Q, H, D)`` tensors.
