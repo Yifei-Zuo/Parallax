@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
+# Adapted from flash_attn.cute.pipeline (https://github.com/Dao-AILab/flash-attention).
 
 # import math
 from typing import Optional

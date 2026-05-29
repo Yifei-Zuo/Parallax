@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
+# Adapted from flash_attn.cute.hopper_helpers (https://github.com/Dao-AILab/flash-attention).
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import warpgroup
