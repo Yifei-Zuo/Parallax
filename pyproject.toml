@@ -24,18 +24,28 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+# The kernel's cute helpers are vendored in-tree under ``parallax/cute/_vendor/``
+# (see VENDOR.md), so the kernel install path only needs cutlass-dsl + torch +
+# triton — no flash_attn C++ build. flash_attn moves to the ``bench`` extra
+# because it's only used for the FA2 baseline column in scripts/bench_decode.py.
 dependencies = [
     "torch==2.5.1",
     "triton==3.1.0",
     "nvidia-cutlass-dsl==4.1.0",
     "nvidia-cutlass-dsl-libs-base==4.5.2",
-    "flash_attn==2.8.3",
     "numpy",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
-bench = ["psutil", "rich>=13"]
+# rich       — Live-updating result table in scripts/bench_decode.py.
+# psutil     — host-side process stats.
+# flash_attn — FA2 baseline (``flash_attn_with_kvcache``). Needs
+#              ``--no-build-isolation`` because flash_attn's setup.py imports
+#              torch at build time. FA3 (``flash_attn_3``) is NOT on PyPI —
+#              build it from the Dao-AILab/flash-attention ``hopper`` subdir
+#              if you want the FA3 column (see install.sh step 6).
+bench = ["psutil", "rich>=13", "flash_attn==2.8.3"]
 
 [project.urls]
 Homepage = "https://github.com/Yifei-Zuo/Parallax"

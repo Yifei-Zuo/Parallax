@@ -54,9 +54,11 @@ from cutlass._mlir.dialects import nvvm
 from cutlass._mlir.dialects import llvm as _mlir_llvm
 
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-from flash_attn.cute import hopper_helpers as sm90_utils
-from flash_attn.cute import pipeline
-from flash_attn.cute import utils
+# Vendored from flash_attn.cute (BSD-3-Clause, Copyright (c) 2025, Tri Dao).
+# See parallax/cute/_vendor/VENDOR.md for provenance and the 11 symbols used.
+from parallax.cute._vendor import hopper_helpers as sm90_utils
+from parallax.cute._vendor import pipeline
+from parallax.cute._vendor import utils
 
 
 @cute.jit
