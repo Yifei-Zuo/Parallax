@@ -34,7 +34,8 @@ Restrictions:
   * bf16 or fp16 input
   * seqlen_q = 1 (decoding only)
   * head_dim in {64, 128}
-  * kv_len must be a multiple of B_c = 64
+  * kv_len can be any positive integer; the last tile is masked when
+    kv_len is not a multiple of B_c = 64
 """
 
 from __future__ import annotations
@@ -323,8 +324,17 @@ class ParallaxDecodePersistentSplit:
         # constexpr (derived from kv_len, n_block_size, num_k_splits);
         # k_start_tile/k_end_tile are runtime values (depend on the
         # grid-Z block index).
-        tiles_total: cutlass.Constexpr[int] = kv_len // self.n_block_size
+        #
+        # tiles_total uses ceil-div so kv_len need not be a multiple of
+        # B_c = n_block_size; the last tile may have fewer than B_c
+        # valid columns. `valid_n_last_tile` is the constexpr number of
+        # valid KV positions in that final tile (== B_c when kv_len is
+        # a clean multiple). The mask is applied only when this
+        # constexpr is strictly less than B_c (see _apply_last_tile_mask
+        # call sites).
+        tiles_total: cutlass.Constexpr[int] = (kv_len + self.n_block_size - 1) // self.n_block_size
         tiles_per_split: cutlass.Constexpr[int] = (tiles_total + num_k_splits - 1) // num_k_splits
+        valid_n_last_tile: cutlass.Constexpr[int] = kv_len - (tiles_total - 1) * self.n_block_size
         k_start_tile = k_split_id * tiles_per_split
         k_end_tile_uncapped = k_start_tile + tiles_per_split
         # Cap the last split at tiles_total when tiles_total is not a multiple of
@@ -489,6 +499,14 @@ class ParallaxDecodePersistentSplit:
         k_start_tile: Int32,
         k_end_tile: Int32,
     ) -> None:
+        # Re-derive the constexpr partial-last-tile bookkeeping (also computed in
+        # the outer @cute.kernel scope but not visible here): tiles_total counts
+        # tiles via ceil-div so kv_len need not be a multiple of B_c; the last
+        # tile may have fewer than B_c valid columns, captured by
+        # `valid_n_last_tile` in [1, B_c].
+        tiles_total: cutlass.Constexpr[int] = (kv_len + self.n_block_size - 1) // self.n_block_size
+        valid_n_last_tile: cutlass.Constexpr[int] = kv_len - (tiles_total - 1) * self.n_block_size
+
         wg_layout = cute.make_layout(1, stride=self.num_threads_per_warp_group)
         wg_mma_qk = tiled_mma_qk.get_slice(wg_layout(0))
         wg_mma_pv = tiled_mma_pv.get_slice(wg_layout(0))
@@ -1046,6 +1064,15 @@ class ParallaxDecodePersistentSplit:
         warpgroup.wait_group(0)
         pipeline_k.consumer_release(consumer_state)
 
+        # Mask the last partial tile's invalid columns to -inf so softmax gives
+        # them zero weight. Only meaningful when kv_len is not a multiple of B_c
+        # (else the const_expr branch is dead and folded away). The runtime
+        # check covers the case where this CTA's k_start_tile already IS the
+        # last global tile (single-tile per CTA).
+        if const_expr(valid_n_last_tile < self.n_block_size):
+            valid_n_iter0 = Int32(valid_n_last_tile) if k_start_tile == tiles_total - 1 else Int32(self.n_block_size)
+            self._apply_last_tile_mask(acc_QR, tiled_mma_qk, valid_n_iter0)
+
         m_r, d1, d2, _alpha0 = self._row0_online_softmax_and_make_p(
             acc_QR,
             tiled_mma_qk,
@@ -1073,7 +1100,10 @@ class ParallaxDecodePersistentSplit:
         consumer_state_v = consumer_state.clone()
         consumer_state.advance()
 
-        for _ in cutlass.range(k_start_tile, k_end_tile - 1, unroll=1):
+        # Loop variable `t` is the absolute tile index for this iteration
+        # (k_start_tile + 1 .. k_end_tile - 1). We use it to detect the
+        # global-last tile and apply the partial-tile mask there.
+        for t in cutlass.range(k_start_tile + 1, k_end_tile, unroll=1):
             acc_QR = cute.make_fragment(acc_S_shape, Float32)
             pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
             sm90_utils.gemm(
@@ -1088,6 +1118,10 @@ class ParallaxDecodePersistentSplit:
             warpgroup.wait_group(0)
             pipeline_k.consumer_release(consumer_state)
             pipeline_v.consumer_release(consumer_state_v)
+
+            if const_expr(valid_n_last_tile < self.n_block_size):
+                valid_n_t = Int32(valid_n_last_tile) if t == tiles_total - 1 else Int32(self.n_block_size)
+                self._apply_last_tile_mask(acc_QR, tiled_mma_qk, valid_n_t)
 
             m_r, d1, d2, alpha = self._row0_online_softmax_and_make_p(
                 acc_QR,
@@ -1247,6 +1281,42 @@ class ParallaxDecodePersistentSplit:
         d2_new = d2 * alpha + tile_c
 
         return m_r_new, d1_new, d2_new, alpha
+
+    @cute.jit
+    def _apply_last_tile_mask(
+        self,
+        acc_qr: cute.Tensor,
+        tiled_mma_qk: cute.TiledMma,
+        valid_n: Int32,
+    ) -> None:
+        """Set S_1 to -inf for KV columns beyond ``valid_n`` (row 0 only).
+
+        Used to support kv_len that is not a multiple of B_c: the last
+        tile may cover fewer than B_c valid KV positions, and the
+        excess columns must be masked out before softmax so they
+        contribute 0 to P_1, d_1, d_2, O_1, O_2. TMA's default OOB
+        behaviour delivers zeros for the out-of-bounds K/V slots, but
+        zero attention logits would still receive a non-zero softmax
+        weight, so we explicitly drive S_1 to -inf instead.
+
+        Only row 0 (S_1 = Q_r * K_c^T) is masked. Row 1 (S_2 =
+        R_r * K_c^T) is left as TMA delivered it (zeros for OOB K),
+        which gives P_2 = P_1 * S_2 = 0 for masked columns. Forcing
+        S_2 to -inf as well would produce 0 * -inf = NaN inside the
+        composite-score accumulation.
+
+        Predicate is per-c_i (constexpr column coordinate) compared to
+        the runtime ``valid_n``; when ``valid_n == B_c`` the check is
+        statically false everywhere and the compiler folds it away.
+        """
+        acc_mn = utils.make_acc_tensor_mn_view(acc_qr)
+        thr_mma = tiled_mma_qk.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
+        cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+        cS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS))
+        r0 = 0
+        for c_i in cutlass.range(cute.size(acc_mn, mode=[1]), unroll_full=True):
+            if cS_mn[r0, c_i][0] == 0 and cS_mn[r0, c_i][1] >= valid_n:
+                acc_mn[r0, c_i] = -Float32.inf
 
     @cute.jit
     def _scale_output_rows01(self, acc: cute.Tensor, alpha: Float32, tiled_mma: cute.TiledMma) -> None:
@@ -1556,8 +1626,8 @@ def parallax_decode_cutedsl_sm90(
         raise RuntimeError("SM90 TMA/WGMMA CuTe backend requires compute capability 9.x")
     if q.shape[-1] > 128:
         raise ValueError("SM90 TMA/WGMMA CuTe backend currently supports head_dim <= 128")
-    if k.shape[1] % 64 != 0:
-        raise ValueError("SM90 TMA/WGMMA prototype currently requires kv_len % 64 == 0")
+    if k.shape[1] <= 0:
+        raise ValueError("kv_len must be positive")
     if ws is None:
         raise ValueError(
             "Parallax always uses the in-kernel fused epilogue and requires the "
