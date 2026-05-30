@@ -1,0 +1,573 @@
+# Copyright (c) 2026 Yifei Zuo.
+# SPDX-License-Identifier: MIT
+"""Backward Triton kernels for Parallax attention.
+
+Three kernels in sequence:
+
+  * ``_bwd_preprocess_kernel`` — per-row reductions ``t = Σ_d grad_o · o``
+    and ``b = Σ_d grad_o · barv``.
+  * ``_bwd_rq_kernel`` — accumulates ``grad_q`` and ``grad_r``.
+  * ``_bwd_kv_kernel`` — accumulates ``grad_k`` and ``grad_v``.
+
+Driven by :func:`parallax_bwd`, which expects the saved ``(o, barv, d1, bart, m)``
+tensors from :func:`parallax_fwd`.
+"""
+
+import math
+
+import torch
+import triton
+import triton.language as tl
+
+
+_TILE_SIZES = (32, 64, 128)
+_WARP_COUNTS = (4, 8)
+_STAGE_COUNTS = (2, 4)
+_CONFIGS = [
+    triton.Config({"ROW_TILE_SIZE": r, "COL_TILE_SIZE": c}, num_warps=w, num_stages=s)
+    for r in _TILE_SIZES
+    for c in _TILE_SIZES
+    for w in _WARP_COUNTS
+    for s in _STAGE_COUNTS
+]
+_PREPROCESS_CONFIGS = [
+    triton.Config({"ROW_TILE_SIZE": r}, num_warps=w, num_stages=s)
+    for r in (64, 128, 256)
+    for w in (4, 8)
+    for s in (2, 4)
+]
+
+
+def _prune_bwd_configs_by_head_dim(configs, named_args, **kwargs):
+    # At HEAD_DIM >= 256, ROW_TILE_SIZE=128 spills registers.
+    head_dim = named_args.get("HEAD_DIM", 0)
+    if head_dim >= 256:
+        pruned = [c for c in configs if c.kwargs["ROW_TILE_SIZE"] <= 64]
+        return pruned if pruned else configs[:1]
+    return configs
+
+
+@triton.autotune(configs=_PREPROCESS_CONFIGS, key=["N_QUERIES", "HEAD_DIM"])
+@triton.jit
+def _bwd_preprocess_kernel(
+    grad_o_ptr,
+    o_ptr,
+    barv_ptr,
+    t_ptr,
+    b_ptr,
+    stride_gob, stride_goq, stride_god,
+    stride_ob, stride_oq, stride_od,
+    stride_barv_b, stride_barv_q, stride_barv_d,
+    stride_tb, stride_tq,
+    stride_bb, stride_bq,
+    N_QUERIES,
+    HEAD_DIM: tl.constexpr,
+    ROW_TILE_SIZE: tl.constexpr,
+):
+    pid_batch = tl.program_id(1)
+    pid_row = tl.program_id(0)
+    row_offset = pid_row * ROW_TILE_SIZE
+
+    grad_o_block_ptr = tl.make_block_ptr(
+        base=grad_o_ptr + pid_batch * stride_gob,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_goq, stride_god),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    o_block_ptr = tl.make_block_ptr(
+        base=o_ptr + pid_batch * stride_ob,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_oq, stride_od),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    barv_block_ptr = tl.make_block_ptr(
+        base=barv_ptr + pid_batch * stride_barv_b,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_barv_q, stride_barv_d),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    t_block_ptr = tl.make_block_ptr(
+        base=t_ptr + pid_batch * stride_tb,
+        shape=(N_QUERIES, 1), strides=(stride_tq, 1),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    b_block_ptr = tl.make_block_ptr(
+        base=b_ptr + pid_batch * stride_bb,
+        shape=(N_QUERIES, 1), strides=(stride_bq, 1),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+
+    grad_o = tl.load(grad_o_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    O_tile = tl.load(o_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    barv = tl.load(barv_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+    grad_o_f32 = grad_o.to(tl.float32)
+    t = tl.sum(grad_o_f32 * O_tile.to(tl.float32), axis=1, keep_dims=True)
+    b = tl.sum(grad_o_f32 * barv.to(tl.float32), axis=1, keep_dims=True)
+
+    tl.store(t_block_ptr, t, boundary_check=(0, 1))
+    tl.store(b_block_ptr, b, boundary_check=(0, 1))
+
+
+@triton.autotune(
+    configs=_CONFIGS,
+    key=["N_QUERIES", "N_KEYVALS", "HEAD_DIM"],
+    prune_configs_by={"early_config_prune": _prune_bwd_configs_by_head_dim},
+)
+@triton.jit
+def _bwd_rq_kernel(
+    q_ptr,
+    r_ptr,
+    k_ptr,
+    v_ptr,
+    d1_ptr,
+    bart_ptr,
+    m_ptr,
+    t_ptr,
+    b_ptr,
+    grad_o_ptr,
+    grad_q_ptr,
+    grad_r_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_rb, stride_rq, stride_rd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_d1_b, stride_d1_q,
+    stride_bart_b, stride_bart_q,
+    stride_m_b, stride_m_q,
+    stride_tb, stride_tq,
+    stride_bb, stride_bq,
+    stride_gob, stride_goq, stride_god,
+    stride_gqb, stride_gqq, stride_gqd,
+    stride_grb, stride_grq, stride_grd,
+    qk_scale,
+    N_QUERIES,
+    N_KEYVALS,
+    HEAD_DIM: tl.constexpr,
+    ROW_TILE_SIZE: tl.constexpr,
+    COL_TILE_SIZE: tl.constexpr,
+):
+    pid_batch = tl.program_id(1)
+    pid_row = tl.program_id(0)
+    row_offset = pid_row * ROW_TILE_SIZE
+    row_indices = row_offset + tl.arange(0, ROW_TILE_SIZE)
+    row_mask = row_indices[:, None] < N_QUERIES
+    NUM_TOTAL_BLOCKS = tl.cdiv(tl.minimum(N_KEYVALS, row_offset + ROW_TILE_SIZE), COL_TILE_SIZE)
+    NUM_SAFE_BLOCKS = tl.minimum(row_offset, N_KEYVALS) // COL_TILE_SIZE
+
+    q_block_ptr = tl.make_block_ptr(
+        base=q_ptr + pid_batch * stride_qb,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_qq, stride_qd),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    r_block_ptr = tl.make_block_ptr(
+        base=r_ptr + pid_batch * stride_rb,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_rq, stride_rd),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    k_block_ptr = tl.make_block_ptr(
+        base=k_ptr + pid_batch * stride_kb,
+        shape=(N_KEYVALS, HEAD_DIM), strides=(stride_kk, stride_kd),
+        offsets=(0, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    v_block_ptr = tl.make_block_ptr(
+        base=v_ptr + pid_batch * stride_vb,
+        shape=(N_KEYVALS, HEAD_DIM), strides=(stride_vk, stride_vd),
+        offsets=(0, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    d1_block_ptr = tl.make_block_ptr(
+        base=d1_ptr + pid_batch * stride_d1_b,
+        shape=(N_QUERIES, 1), strides=(stride_d1_q, 1),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    bart_block_ptr = tl.make_block_ptr(
+        base=bart_ptr + pid_batch * stride_bart_b,
+        shape=(N_QUERIES, 1), strides=(stride_bart_q, 1),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    m_block_ptr = tl.make_block_ptr(
+        base=m_ptr + pid_batch * stride_m_b,
+        shape=(N_QUERIES, 1), strides=(stride_m_q, 1),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    t_block_ptr = tl.make_block_ptr(
+        base=t_ptr + pid_batch * stride_tb,
+        shape=(N_QUERIES, 1), strides=(stride_tq, 1),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    b_block_ptr = tl.make_block_ptr(
+        base=b_ptr + pid_batch * stride_bb,
+        shape=(N_QUERIES, 1), strides=(stride_bq, 1),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    grad_o_block_ptr = tl.make_block_ptr(
+        base=grad_o_ptr + pid_batch * stride_gob,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_goq, stride_god),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    grad_q_block_ptr = tl.make_block_ptr(
+        base=grad_q_ptr + pid_batch * stride_gqb,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_gqq, stride_gqd),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    grad_r_block_ptr = tl.make_block_ptr(
+        base=grad_r_ptr + pid_batch * stride_grb,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_grq, stride_grd),
+        offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+
+    Q = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    R = tl.load(r_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    d1 = tl.load(d1_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    bart = tl.load(bart_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    m = tl.load(m_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    t = tl.load(t_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    grad_o = tl.load(grad_o_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    grad_q_acc = tl.zeros((ROW_TILE_SIZE, HEAD_DIM), dtype=tl.float32)
+    grad_r_acc = tl.zeros((ROW_TILE_SIZE, HEAD_DIM), dtype=tl.float32)
+    qk_scale_log2 = qk_scale * 1.44269504
+
+    inv_d1 = tl.where(row_mask, 1.0 / d1, 0.0)
+
+    # Phase A: safe blocks (no mask).
+    for col_block_id in range(NUM_SAFE_BLOCKS):
+        K = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        V = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
+        w = tl.math.exp2(qk - m)
+        a = tl.dot(grad_o, tl.trans(V), out_dtype=tl.float32)
+        rk = tl.dot(R, tl.trans(K), out_dtype=tl.float32)
+        p = w * inv_d1
+        bart_minus_rk = bart - rk
+        delta = a - b
+        gl = p * (a - t + bart_minus_rk * delta)
+        gu = -p * delta
+        grad_q_acc = tl.dot(gl.to(tl.bfloat16), K, out_dtype=tl.float32, acc=grad_q_acc)
+        grad_r_acc = tl.dot(gu.to(tl.bfloat16), K, out_dtype=tl.float32, acc=grad_r_acc)
+        k_block_ptr = tl.advance(k_block_ptr, (COL_TILE_SIZE, 0))
+        v_block_ptr = tl.advance(v_block_ptr, (COL_TILE_SIZE, 0))
+
+    # Phase B: border blocks (causal + boundary mask).
+    for col_block_id in range(NUM_SAFE_BLOCKS, NUM_TOTAL_BLOCKS):
+        col_offset = col_block_id * COL_TILE_SIZE
+        col_indices = col_offset + tl.arange(0, COL_TILE_SIZE)
+        K = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        V = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        mask = (
+            (row_indices[:, None] >= col_indices[None, :])
+            & row_mask
+            & (col_indices[None, :] < N_KEYVALS)
+        )
+        qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
+        qk = tl.where(mask, qk, -float("inf"))
+        w = tl.math.exp2(qk - m)
+        a = tl.dot(grad_o, tl.trans(V), out_dtype=tl.float32)
+        rk = tl.dot(R, tl.trans(K), out_dtype=tl.float32)
+        p = w * inv_d1
+        bart_minus_rk = bart - rk
+        delta = a - b
+        gl = p * (a - t + bart_minus_rk * delta)
+        gu = -p * delta
+        grad_q_acc = tl.dot(gl.to(tl.bfloat16), K, out_dtype=tl.float32, acc=grad_q_acc)
+        grad_r_acc = tl.dot(gu.to(tl.bfloat16), K, out_dtype=tl.float32, acc=grad_r_acc)
+        k_block_ptr = tl.advance(k_block_ptr, (COL_TILE_SIZE, 0))
+        v_block_ptr = tl.advance(v_block_ptr, (COL_TILE_SIZE, 0))
+
+    grad_q_acc = qk_scale * grad_q_acc
+
+    tl.store(grad_q_block_ptr, grad_q_acc.to(tl.bfloat16), boundary_check=(0, 1))
+    tl.store(grad_r_block_ptr, grad_r_acc.to(tl.bfloat16), boundary_check=(0, 1))
+
+
+@triton.autotune(
+    configs=_CONFIGS,
+    key=["N_QUERIES", "N_KEYVALS", "HEAD_DIM"],
+    prune_configs_by={"early_config_prune": _prune_bwd_configs_by_head_dim},
+)
+@triton.jit
+def _bwd_kv_kernel(
+    q_ptr,
+    r_ptr,
+    k_ptr,
+    v_ptr,
+    d1_ptr,
+    bart_ptr,
+    m_ptr,
+    t_ptr,
+    b_ptr,
+    grad_o_ptr,
+    grad_k_ptr,
+    grad_v_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_rb, stride_rq, stride_rd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_d1_b, stride_d1_q,
+    stride_bart_b, stride_bart_q,
+    stride_m_b, stride_m_q,
+    stride_tb, stride_tq,
+    stride_bb, stride_bq,
+    stride_gob, stride_goq, stride_god,
+    stride_gkb, stride_gkk, stride_gkd,
+    stride_gvb, stride_gvk, stride_gvd,
+    qk_scale,
+    N_QUERIES,
+    N_KEYVALS,
+    HEAD_DIM: tl.constexpr,
+    ROW_TILE_SIZE: tl.constexpr,
+    COL_TILE_SIZE: tl.constexpr,
+):
+    pid_batch = tl.program_id(1)
+    pid_col = tl.program_id(0)
+    col_offset = pid_col * COL_TILE_SIZE
+    col_indices = col_offset + tl.arange(0, COL_TILE_SIZE)
+
+    start_row_block = col_offset // ROW_TILE_SIZE
+    start_row_offset = start_row_block * ROW_TILE_SIZE
+    num_row_blocks = tl.cdiv(N_QUERIES, ROW_TILE_SIZE)
+
+    q_block_ptr = tl.make_block_ptr(
+        base=q_ptr + pid_batch * stride_qb,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_qq, stride_qd),
+        offsets=(start_row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    r_block_ptr = tl.make_block_ptr(
+        base=r_ptr + pid_batch * stride_rb,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_rq, stride_rd),
+        offsets=(start_row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    k_block_ptr = tl.make_block_ptr(
+        base=k_ptr + pid_batch * stride_kb,
+        shape=(N_KEYVALS, HEAD_DIM), strides=(stride_kk, stride_kd),
+        offsets=(col_offset, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    v_block_ptr = tl.make_block_ptr(
+        base=v_ptr + pid_batch * stride_vb,
+        shape=(N_KEYVALS, HEAD_DIM), strides=(stride_vk, stride_vd),
+        offsets=(col_offset, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    d1_block_ptr = tl.make_block_ptr(
+        base=d1_ptr + pid_batch * stride_d1_b,
+        shape=(N_QUERIES, 1), strides=(stride_d1_q, 1),
+        offsets=(start_row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    bart_block_ptr = tl.make_block_ptr(
+        base=bart_ptr + pid_batch * stride_bart_b,
+        shape=(N_QUERIES, 1), strides=(stride_bart_q, 1),
+        offsets=(start_row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    m_block_ptr = tl.make_block_ptr(
+        base=m_ptr + pid_batch * stride_m_b,
+        shape=(N_QUERIES, 1), strides=(stride_m_q, 1),
+        offsets=(start_row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    t_block_ptr = tl.make_block_ptr(
+        base=t_ptr + pid_batch * stride_tb,
+        shape=(N_QUERIES, 1), strides=(stride_tq, 1),
+        offsets=(start_row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    b_block_ptr = tl.make_block_ptr(
+        base=b_ptr + pid_batch * stride_bb,
+        shape=(N_QUERIES, 1), strides=(stride_bq, 1),
+        offsets=(start_row_offset, 0), block_shape=(ROW_TILE_SIZE, 1), order=(1, 0),
+    )
+    grad_o_block_ptr = tl.make_block_ptr(
+        base=grad_o_ptr + pid_batch * stride_gob,
+        shape=(N_QUERIES, HEAD_DIM), strides=(stride_goq, stride_god),
+        offsets=(start_row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    grad_k_block_ptr = tl.make_block_ptr(
+        base=grad_k_ptr + pid_batch * stride_gkb,
+        shape=(N_KEYVALS, HEAD_DIM), strides=(stride_gkk, stride_gkd),
+        offsets=(col_offset, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+    grad_v_block_ptr = tl.make_block_ptr(
+        base=grad_v_ptr + pid_batch * stride_gvb,
+        shape=(N_KEYVALS, HEAD_DIM), strides=(stride_gvk, stride_gvd),
+        offsets=(col_offset, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
+    )
+
+    K = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    V = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    grad_k_acc = tl.zeros((COL_TILE_SIZE, HEAD_DIM), dtype=tl.float32)
+    grad_v_acc = tl.zeros((COL_TILE_SIZE, HEAD_DIM), dtype=tl.float32)
+    qk_scale_log2 = qk_scale * 1.44269504
+
+    # Safe phase starts when min(row) > max(col), i.e.
+    #     row_offset >= col_offset + COL_TILE_SIZE.
+    first_safe_row_block = tl.cdiv(col_offset + COL_TILE_SIZE, ROW_TILE_SIZE)
+
+    # Phase A: border row blocks (causal + boundary mask).
+    for row_block_id in range(start_row_block, first_safe_row_block):
+        row_offset = row_block_id * ROW_TILE_SIZE
+        row_indices = row_offset + tl.arange(0, ROW_TILE_SIZE)
+        row_mask = row_indices[:, None] < N_QUERIES
+        Q = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        R = tl.load(r_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        d1 = tl.load(d1_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        bart = tl.load(bart_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        m = tl.load(m_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        t = tl.load(t_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        grad_o = tl.load(grad_o_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
+        rk = tl.dot(R, tl.trans(K), out_dtype=tl.float32)
+        inv_d1 = tl.where(row_mask, 1.0 / d1, 0.0)
+        mask = (
+            (row_indices[:, None] >= col_indices[None, :])
+            & row_mask
+            & (col_indices[None, :] < N_KEYVALS)
+        )
+        qk = tl.where(mask, qk, -float("inf"))
+        w = tl.math.exp2(qk - m)
+        p = w * inv_d1
+        a = tl.dot(grad_o, tl.trans(V), out_dtype=tl.float32)
+        delta = a - b
+        bart_minus_rk = bart - rk
+        gl = p * (a - t + bart_minus_rk * delta) * qk_scale
+        gu = -p * delta
+        grad_k_acc = tl.dot(tl.trans(gl).to(tl.bfloat16), Q, out_dtype=tl.float32, acc=grad_k_acc)
+        grad_k_acc = tl.dot(tl.trans(gu).to(tl.bfloat16), R, out_dtype=tl.float32, acc=grad_k_acc)
+        weights = p * (1 + bart_minus_rk)
+        grad_v_acc = tl.dot(tl.trans(weights).to(tl.bfloat16), grad_o, out_dtype=tl.float32, acc=grad_v_acc)
+
+        q_block_ptr = tl.advance(q_block_ptr, (ROW_TILE_SIZE, 0))
+        r_block_ptr = tl.advance(r_block_ptr, (ROW_TILE_SIZE, 0))
+        d1_block_ptr = tl.advance(d1_block_ptr, (ROW_TILE_SIZE, 0))
+        bart_block_ptr = tl.advance(bart_block_ptr, (ROW_TILE_SIZE, 0))
+        m_block_ptr = tl.advance(m_block_ptr, (ROW_TILE_SIZE, 0))
+        t_block_ptr = tl.advance(t_block_ptr, (ROW_TILE_SIZE, 0))
+        b_block_ptr = tl.advance(b_block_ptr, (ROW_TILE_SIZE, 0))
+        grad_o_block_ptr = tl.advance(grad_o_block_ptr, (ROW_TILE_SIZE, 0))
+
+    # Phase B: safe row blocks (no causal/col mask; row_mask still needed for
+    # the last partial block guarding inv_d1).
+    for row_block_id in range(first_safe_row_block, num_row_blocks):
+        row_offset = row_block_id * ROW_TILE_SIZE
+        row_indices = row_offset + tl.arange(0, ROW_TILE_SIZE)
+        row_mask = row_indices[:, None] < N_QUERIES
+        Q = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        R = tl.load(r_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        d1 = tl.load(d1_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        bart = tl.load(bart_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        m = tl.load(m_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        t = tl.load(t_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        grad_o = tl.load(grad_o_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
+        rk = tl.dot(R, tl.trans(K), out_dtype=tl.float32)
+        inv_d1 = tl.where(row_mask, 1.0 / d1, 0.0)
+        w = tl.math.exp2(qk - m)
+        p = w * inv_d1
+        a = tl.dot(grad_o, tl.trans(V), out_dtype=tl.float32)
+        delta = a - b
+        bart_minus_rk = bart - rk
+        gl = p * (a - t + bart_minus_rk * delta) * qk_scale
+        gu = -p * delta
+        grad_k_acc = tl.dot(tl.trans(gl).to(tl.bfloat16), Q, out_dtype=tl.float32, acc=grad_k_acc)
+        grad_k_acc = tl.dot(tl.trans(gu).to(tl.bfloat16), R, out_dtype=tl.float32, acc=grad_k_acc)
+        weights = p * (1 + bart_minus_rk)
+        grad_v_acc = tl.dot(tl.trans(weights).to(tl.bfloat16), grad_o, out_dtype=tl.float32, acc=grad_v_acc)
+
+        q_block_ptr = tl.advance(q_block_ptr, (ROW_TILE_SIZE, 0))
+        r_block_ptr = tl.advance(r_block_ptr, (ROW_TILE_SIZE, 0))
+        d1_block_ptr = tl.advance(d1_block_ptr, (ROW_TILE_SIZE, 0))
+        bart_block_ptr = tl.advance(bart_block_ptr, (ROW_TILE_SIZE, 0))
+        m_block_ptr = tl.advance(m_block_ptr, (ROW_TILE_SIZE, 0))
+        t_block_ptr = tl.advance(t_block_ptr, (ROW_TILE_SIZE, 0))
+        b_block_ptr = tl.advance(b_block_ptr, (ROW_TILE_SIZE, 0))
+        grad_o_block_ptr = tl.advance(grad_o_block_ptr, (ROW_TILE_SIZE, 0))
+
+    tl.store(grad_k_block_ptr, grad_k_acc.to(tl.bfloat16), boundary_check=(0, 1))
+    tl.store(grad_v_block_ptr, grad_v_acc.to(tl.bfloat16), boundary_check=(0, 1))
+
+
+def parallax_bwd(
+    q: torch.Tensor,
+    r: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    barv: torch.Tensor,
+    d1: torch.Tensor,
+    bart: torch.Tensor,
+    m: torch.Tensor,
+    grad_o: torch.Tensor,
+    qk_scale: float | torch.Tensor,
+):
+    """Parallax backward pass (Triton, training).
+
+    Args:
+        q, r, k, v: the same tensors passed to :func:`parallax_fwd`.
+        o, barv, d1, bart, m: tensors returned by :func:`parallax_fwd`.
+        grad_o: gradient of the loss w.r.t. ``o``.
+        qk_scale: matches the value passed to :func:`parallax_fwd`.
+
+    Returns:
+        ``(grad_q, grad_r, grad_k, grad_v)`` — bf16 tensors with the same
+        shapes as ``q, r, k, v``.
+    """
+    batch_size, n_queries, head_dim = q.shape
+    n_keyvals = k.shape[1]
+    grad_q = torch.empty_like(q, dtype=torch.bfloat16)
+    grad_r = torch.empty_like(r, dtype=torch.bfloat16)
+    grad_k = torch.empty_like(k, dtype=torch.bfloat16)
+    grad_v = torch.empty_like(v, dtype=torch.bfloat16)
+
+    t = torch.empty((batch_size, n_queries, 1), device=q.device, dtype=torch.float32)
+    b = torch.empty((batch_size, n_queries, 1), device=q.device, dtype=torch.float32)
+    pre_grid = lambda META: (math.ceil(n_queries / META["ROW_TILE_SIZE"]), batch_size)
+    _bwd_preprocess_kernel[pre_grid](
+        grad_o, o, barv, t, b,
+        grad_o.stride(0), grad_o.stride(1), grad_o.stride(2),
+        o.stride(0), o.stride(1), o.stride(2),
+        barv.stride(0), barv.stride(1), barv.stride(2),
+        t.stride(0), t.stride(1),
+        b.stride(0), b.stride(1),
+        n_queries,
+        head_dim,
+    )
+
+    rq_grid = lambda META: (math.ceil(n_queries / META["ROW_TILE_SIZE"]), batch_size)
+    kv_grid = lambda META: (math.ceil(n_keyvals / META["COL_TILE_SIZE"]), batch_size)
+
+    _bwd_rq_kernel[rq_grid](
+        q, r, k, v, d1, bart, m, t, b, grad_o, grad_q, grad_r,
+        q.stride(0), q.stride(1), q.stride(2),
+        r.stride(0), r.stride(1), r.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        d1.stride(0), d1.stride(1),
+        bart.stride(0), bart.stride(1),
+        m.stride(0), m.stride(1),
+        t.stride(0), t.stride(1),
+        b.stride(0), b.stride(1),
+        grad_o.stride(0), grad_o.stride(1), grad_o.stride(2),
+        grad_q.stride(0), grad_q.stride(1), grad_q.stride(2),
+        grad_r.stride(0), grad_r.stride(1), grad_r.stride(2),
+        qk_scale,
+        n_queries,
+        n_keyvals,
+        head_dim,
+    )
+
+    _bwd_kv_kernel[kv_grid](
+        q, r, k, v, d1, bart, m, t, b, grad_o, grad_k, grad_v,
+        q.stride(0), q.stride(1), q.stride(2),
+        r.stride(0), r.stride(1), r.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        d1.stride(0), d1.stride(1),
+        bart.stride(0), bart.stride(1),
+        m.stride(0), m.stride(1),
+        t.stride(0), t.stride(1),
+        b.stride(0), b.stride(1),
+        grad_o.stride(0), grad_o.stride(1), grad_o.stride(2),
+        grad_k.stride(0), grad_k.stride(1), grad_k.stride(2),
+        grad_v.stride(0), grad_v.stride(1), grad_v.stride(2),
+        qk_scale,
+        n_queries,
+        n_keyvals,
+        head_dim,
+    )
+    return grad_q, grad_r, grad_k, grad_v
