@@ -1,9 +1,4 @@
-"""Shared shape grids + input factory for the verify and bench scripts.
-
-Mirrors ``flashlla/dev_ops/decode_h200_v4/_test_utils.py`` from the upstream
-dev tree so both scripts use a single source of truth for ``(B, K, H, D)``
-cases.
-"""
+"""Shared shape grids + input factory for the bench and parity scripts."""
 
 from __future__ import annotations
 
@@ -31,7 +26,7 @@ REFERENCE_SHAPES = [
 
 
 def extended_grid():
-    """288-shape sweep (kept for cross-comparison with the upstream v3 run)."""
+    """288-shape sweep over ``(B, H) ∈ {1, 2, 4, 8} × {1, 4, 8, 16}``."""
     shapes = []
     for B in (1, 2, 4, 8):
         for H in (1, 4, 8, 16):

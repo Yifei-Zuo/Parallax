@@ -25,16 +25,16 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch==2.5.1",
-    "triton==3.1.0",
+    "torch==2.9.1",
+    "triton==3.5.1",
     "nvidia-cutlass-dsl==4.1.0",
-    "nvidia-cutlass-dsl-libs-base==4.5.2",
+    "nvidia-cutlass-dsl-libs-base",
     "numpy",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
-bench = ["psutil", "rich>=13", "flash_attn==2.8.3"]
+bench = ["psutil", "rich>=13", "flash_attn>=2.8.3"]
 
 [project.urls]
 Homepage = "https://github.com/Yifei-Zuo/Parallax"
@@ -45,12 +45,16 @@ include = ["parallax*"]
 exclude = ["scripts*", "assets*"]
 
 [tool.uv]
+# flash_attn (FA2) imports torch in setup.py — disable build isolation so
+# its build env matches the runtime torch version.
 no-build-isolation-package = ["flash_attn"]
+# The pytorch wheel index needs this hint to resolve x86_64 wheels.
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
+torch = { index = "pytorch-cu126" }
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true

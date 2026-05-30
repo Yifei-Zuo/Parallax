@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Yifei Zuo.
 # SPDX-License-Identifier: MIT
-"""Backward Triton kernels for Parallax attention.
+"""Backward Triton kernels for Parallax.
 
 Three kernels in sequence:
 
@@ -9,8 +9,12 @@ Three kernels in sequence:
   * ``_bwd_rq_kernel`` — accumulates ``grad_q`` and ``grad_r``.
   * ``_bwd_kv_kernel`` — accumulates ``grad_k`` and ``grad_v``.
 
-Driven by :func:`parallax_bwd`, which expects the saved ``(o, barv, d1, bart, m)``
-tensors from :func:`parallax_fwd`.
+Driven by :func:`parallax_bwd`, which expects the saved tensors from
+:func:`parallax_fwd`. Under GQA (``n_rep > 1``), dK/dV are written
+per-q-head and the launcher folds them back to the kv-head axis via a sum
+reduce (bit-equivalent to what autograd through ``repeat_kv`` would do).
+Sliding-window attention is exposed via ``window_size_left`` (FA2
+convention; ``-1`` disables).
 """
 
 import math
@@ -108,7 +112,7 @@ def _bwd_preprocess_kernel(
 
 @triton.autotune(
     configs=_CONFIGS,
-    key=["N_QUERIES", "N_KEYVALS", "HEAD_DIM"],
+    key=["N_QUERIES", "N_KEYVALS", "HEAD_DIM", "N_REP", "WINDOW_SIZE_LEFT"],
     prune_configs_by={"early_config_prune": _prune_bwd_configs_by_head_dim},
 )
 @triton.jit
@@ -141,16 +145,31 @@ def _bwd_rq_kernel(
     N_QUERIES,
     N_KEYVALS,
     HEAD_DIM: tl.constexpr,
+    N_REP: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
     ROW_TILE_SIZE: tl.constexpr,
     COL_TILE_SIZE: tl.constexpr,
 ):
     pid_batch = tl.program_id(1)
+    kv_batch_idx = pid_batch // N_REP
     pid_row = tl.program_id(0)
     row_offset = pid_row * ROW_TILE_SIZE
     row_indices = row_offset + tl.arange(0, ROW_TILE_SIZE)
     row_mask = row_indices[:, None] < N_QUERIES
     NUM_TOTAL_BLOCKS = tl.cdiv(tl.minimum(N_KEYVALS, row_offset + ROW_TILE_SIZE), COL_TILE_SIZE)
     NUM_SAFE_BLOCKS = tl.minimum(row_offset, N_KEYVALS) // COL_TILE_SIZE
+
+    # SWA col-block boundaries (see _fwd_kernel for derivation).
+    if WINDOW_SIZE_LEFT >= 0:
+        leftmost_valid = tl.maximum(0, row_offset - WINDOW_SIZE_LEFT + 1)
+        FIRST_COL_BLOCK = leftmost_valid // COL_TILE_SIZE
+        SAFE_LEFT_START = (leftmost_valid + COL_TILE_SIZE - 1) // COL_TILE_SIZE
+    else:
+        FIRST_COL_BLOCK = 0
+        SAFE_LEFT_START = 0
+    LEFT_BORDER_END = tl.minimum(SAFE_LEFT_START, NUM_SAFE_BLOCKS)
+    SAFE_MIDDLE_START = tl.maximum(FIRST_COL_BLOCK, SAFE_LEFT_START)
+    RIGHT_BORDER_START = tl.maximum(FIRST_COL_BLOCK, NUM_SAFE_BLOCKS)
 
     q_block_ptr = tl.make_block_ptr(
         base=q_ptr + pid_batch * stride_qb,
@@ -163,14 +182,14 @@ def _bwd_rq_kernel(
         offsets=(row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
     )
     k_block_ptr = tl.make_block_ptr(
-        base=k_ptr + pid_batch * stride_kb,
+        base=k_ptr + kv_batch_idx * stride_kb,
         shape=(N_KEYVALS, HEAD_DIM), strides=(stride_kk, stride_kd),
-        offsets=(0, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
+        offsets=(FIRST_COL_BLOCK * COL_TILE_SIZE, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
     )
     v_block_ptr = tl.make_block_ptr(
-        base=v_ptr + pid_batch * stride_vb,
+        base=v_ptr + kv_batch_idx * stride_vb,
         shape=(N_KEYVALS, HEAD_DIM), strides=(stride_vk, stride_vd),
-        offsets=(0, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
+        offsets=(FIRST_COL_BLOCK * COL_TILE_SIZE, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
     )
     d1_block_ptr = tl.make_block_ptr(
         base=d1_ptr + pid_batch * stride_d1_b,
@@ -227,8 +246,34 @@ def _bwd_rq_kernel(
 
     inv_d1 = tl.where(row_mask, 1.0 / d1, 0.0)
 
+    # Phase 0: left-border blocks (SWA only).
+    for col_block_id in range(FIRST_COL_BLOCK, LEFT_BORDER_END):
+        col_offset = col_block_id * COL_TILE_SIZE
+        col_indices = col_offset + tl.arange(0, COL_TILE_SIZE)
+        K = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        V = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        mask = (
+            (col_indices[None, :] >= row_indices[:, None] - WINDOW_SIZE_LEFT + 1)
+            & row_mask
+            & (col_indices[None, :] < N_KEYVALS)
+        )
+        qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
+        qk = tl.where(mask, qk, -float("inf"))
+        w = tl.math.exp2(qk - m)
+        a = tl.dot(grad_o, tl.trans(V), out_dtype=tl.float32)
+        rk = tl.dot(R, tl.trans(K), out_dtype=tl.float32)
+        p = w * inv_d1
+        bart_minus_rk = bart - rk
+        delta = a - b
+        gl = p * (a - t + bart_minus_rk * delta)
+        gu = -p * delta
+        grad_q_acc = tl.dot(gl.to(tl.bfloat16), K, out_dtype=tl.float32, acc=grad_q_acc)
+        grad_r_acc = tl.dot(gu.to(tl.bfloat16), K, out_dtype=tl.float32, acc=grad_r_acc)
+        k_block_ptr = tl.advance(k_block_ptr, (COL_TILE_SIZE, 0))
+        v_block_ptr = tl.advance(v_block_ptr, (COL_TILE_SIZE, 0))
+
     # Phase A: safe blocks (no mask).
-    for col_block_id in range(NUM_SAFE_BLOCKS):
+    for col_block_id in range(SAFE_MIDDLE_START, NUM_SAFE_BLOCKS):
         K = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
         qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
@@ -245,17 +290,25 @@ def _bwd_rq_kernel(
         k_block_ptr = tl.advance(k_block_ptr, (COL_TILE_SIZE, 0))
         v_block_ptr = tl.advance(v_block_ptr, (COL_TILE_SIZE, 0))
 
-    # Phase B: border blocks (causal + boundary mask).
-    for col_block_id in range(NUM_SAFE_BLOCKS, NUM_TOTAL_BLOCKS):
+    # Phase B: right-border blocks (causal + boundary + window mask).
+    for col_block_id in range(RIGHT_BORDER_START, NUM_TOTAL_BLOCKS):
         col_offset = col_block_id * COL_TILE_SIZE
         col_indices = col_offset + tl.arange(0, COL_TILE_SIZE)
         K = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
         V = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        mask = (
-            (row_indices[:, None] >= col_indices[None, :])
-            & row_mask
-            & (col_indices[None, :] < N_KEYVALS)
-        )
+        if WINDOW_SIZE_LEFT >= 0:
+            mask = (
+                (row_indices[:, None] >= col_indices[None, :])
+                & (col_indices[None, :] >= row_indices[:, None] - WINDOW_SIZE_LEFT + 1)
+                & row_mask
+                & (col_indices[None, :] < N_KEYVALS)
+            )
+        else:
+            mask = (
+                (row_indices[:, None] >= col_indices[None, :])
+                & row_mask
+                & (col_indices[None, :] < N_KEYVALS)
+            )
         qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
         qk = tl.where(mask, qk, -float("inf"))
         w = tl.math.exp2(qk - m)
@@ -279,7 +332,7 @@ def _bwd_rq_kernel(
 
 @triton.autotune(
     configs=_CONFIGS,
-    key=["N_QUERIES", "N_KEYVALS", "HEAD_DIM"],
+    key=["N_QUERIES", "N_KEYVALS", "HEAD_DIM", "N_REP", "WINDOW_SIZE_LEFT"],
     prune_configs_by={"early_config_prune": _prune_bwd_configs_by_head_dim},
 )
 @triton.jit
@@ -312,17 +365,31 @@ def _bwd_kv_kernel(
     N_QUERIES,
     N_KEYVALS,
     HEAD_DIM: tl.constexpr,
+    N_REP: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
     ROW_TILE_SIZE: tl.constexpr,
     COL_TILE_SIZE: tl.constexpr,
 ):
     pid_batch = tl.program_id(1)
+    kv_batch_idx = pid_batch // N_REP
     pid_col = tl.program_id(0)
     col_offset = pid_col * COL_TILE_SIZE
     col_indices = col_offset + tl.arange(0, COL_TILE_SIZE)
 
     start_row_block = col_offset // ROW_TILE_SIZE
     start_row_offset = start_row_block * ROW_TILE_SIZE
-    num_row_blocks = tl.cdiv(N_QUERIES, ROW_TILE_SIZE)
+
+    # SWA row-block boundaries:
+    #   - num_row_blocks: cap after which rows can no longer reach this col block
+    #   - WINDOW_SAFE_END: last row-block fully within W of every col in the block
+    num_row_blocks_qbound = tl.cdiv(N_QUERIES, ROW_TILE_SIZE)
+    if WINDOW_SIZE_LEFT >= 0:
+        last_row_window = tl.cdiv(col_offset + COL_TILE_SIZE + WINDOW_SIZE_LEFT - 1, ROW_TILE_SIZE)
+        num_row_blocks = tl.minimum(num_row_blocks_qbound, last_row_window)
+        WINDOW_SAFE_END = (col_offset + WINDOW_SIZE_LEFT) // ROW_TILE_SIZE
+    else:
+        num_row_blocks = num_row_blocks_qbound
+        WINDOW_SAFE_END = num_row_blocks
 
     q_block_ptr = tl.make_block_ptr(
         base=q_ptr + pid_batch * stride_qb,
@@ -335,12 +402,12 @@ def _bwd_kv_kernel(
         offsets=(start_row_offset, 0), block_shape=(ROW_TILE_SIZE, HEAD_DIM), order=(1, 0),
     )
     k_block_ptr = tl.make_block_ptr(
-        base=k_ptr + pid_batch * stride_kb,
+        base=k_ptr + kv_batch_idx * stride_kb,
         shape=(N_KEYVALS, HEAD_DIM), strides=(stride_kk, stride_kd),
         offsets=(col_offset, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
     )
     v_block_ptr = tl.make_block_ptr(
-        base=v_ptr + pid_batch * stride_vb,
+        base=v_ptr + kv_batch_idx * stride_vb,
         shape=(N_KEYVALS, HEAD_DIM), strides=(stride_vk, stride_vd),
         offsets=(col_offset, 0), block_shape=(COL_TILE_SIZE, HEAD_DIM), order=(1, 0),
     )
@@ -391,12 +458,16 @@ def _bwd_kv_kernel(
     grad_v_acc = tl.zeros((COL_TILE_SIZE, HEAD_DIM), dtype=tl.float32)
     qk_scale_log2 = qk_scale * 1.44269504
 
-    # Safe phase starts when min(row) > max(col), i.e.
-    #     row_offset >= col_offset + COL_TILE_SIZE.
+    # Safe phase starts when min(row) > max(col) — i.e.
+    # row_offset >= col_offset + COL_TILE_SIZE.
     first_safe_row_block = tl.cdiv(col_offset + COL_TILE_SIZE, ROW_TILE_SIZE)
+    SAFE_MIDDLE_END = tl.minimum(WINDOW_SAFE_END, num_row_blocks)
+    WINDOW_BORDER_START = tl.maximum(first_safe_row_block, WINDOW_SAFE_END)
 
-    # Phase A: border row blocks (causal + boundary mask).
-    for row_block_id in range(start_row_block, first_safe_row_block):
+    # Phase A: causal-border row blocks. Apply causal mask plus window mask
+    # when SWA is on.
+    causal_end = tl.minimum(first_safe_row_block, num_row_blocks)
+    for row_block_id in range(start_row_block, causal_end):
         row_offset = row_block_id * ROW_TILE_SIZE
         row_indices = row_offset + tl.arange(0, ROW_TILE_SIZE)
         row_mask = row_indices[:, None] < N_QUERIES
@@ -412,11 +483,19 @@ def _bwd_kv_kernel(
         qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
         rk = tl.dot(R, tl.trans(K), out_dtype=tl.float32)
         inv_d1 = tl.where(row_mask, 1.0 / d1, 0.0)
-        mask = (
-            (row_indices[:, None] >= col_indices[None, :])
-            & row_mask
-            & (col_indices[None, :] < N_KEYVALS)
-        )
+        if WINDOW_SIZE_LEFT >= 0:
+            mask = (
+                (row_indices[:, None] >= col_indices[None, :])
+                & (col_indices[None, :] >= row_indices[:, None] - WINDOW_SIZE_LEFT + 1)
+                & row_mask
+                & (col_indices[None, :] < N_KEYVALS)
+            )
+        else:
+            mask = (
+                (row_indices[:, None] >= col_indices[None, :])
+                & row_mask
+                & (col_indices[None, :] < N_KEYVALS)
+            )
         qk = tl.where(mask, qk, -float("inf"))
         w = tl.math.exp2(qk - m)
         p = w * inv_d1
@@ -439,9 +518,9 @@ def _bwd_kv_kernel(
         b_block_ptr = tl.advance(b_block_ptr, (ROW_TILE_SIZE, 0))
         grad_o_block_ptr = tl.advance(grad_o_block_ptr, (ROW_TILE_SIZE, 0))
 
-    # Phase B: safe row blocks (no causal/col mask; row_mask still needed for
-    # the last partial block guarding inv_d1).
-    for row_block_id in range(first_safe_row_block, num_row_blocks):
+    # Phase B: safe row blocks (no causal/col/window mask).
+    safe_b_start = tl.maximum(first_safe_row_block, start_row_block)
+    for row_block_id in range(safe_b_start, SAFE_MIDDLE_END):
         row_offset = row_block_id * ROW_TILE_SIZE
         row_indices = row_offset + tl.arange(0, ROW_TILE_SIZE)
         row_mask = row_indices[:, None] < N_QUERIES
@@ -457,6 +536,52 @@ def _bwd_kv_kernel(
         qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
         rk = tl.dot(R, tl.trans(K), out_dtype=tl.float32)
         inv_d1 = tl.where(row_mask, 1.0 / d1, 0.0)
+        w = tl.math.exp2(qk - m)
+        p = w * inv_d1
+        a = tl.dot(grad_o, tl.trans(V), out_dtype=tl.float32)
+        delta = a - b
+        bart_minus_rk = bart - rk
+        gl = p * (a - t + bart_minus_rk * delta) * qk_scale
+        gu = -p * delta
+        grad_k_acc = tl.dot(tl.trans(gl).to(tl.bfloat16), Q, out_dtype=tl.float32, acc=grad_k_acc)
+        grad_k_acc = tl.dot(tl.trans(gu).to(tl.bfloat16), R, out_dtype=tl.float32, acc=grad_k_acc)
+        weights = p * (1 + bart_minus_rk)
+        grad_v_acc = tl.dot(tl.trans(weights).to(tl.bfloat16), grad_o, out_dtype=tl.float32, acc=grad_v_acc)
+
+        q_block_ptr = tl.advance(q_block_ptr, (ROW_TILE_SIZE, 0))
+        r_block_ptr = tl.advance(r_block_ptr, (ROW_TILE_SIZE, 0))
+        d1_block_ptr = tl.advance(d1_block_ptr, (ROW_TILE_SIZE, 0))
+        bart_block_ptr = tl.advance(bart_block_ptr, (ROW_TILE_SIZE, 0))
+        m_block_ptr = tl.advance(m_block_ptr, (ROW_TILE_SIZE, 0))
+        t_block_ptr = tl.advance(t_block_ptr, (ROW_TILE_SIZE, 0))
+        b_block_ptr = tl.advance(b_block_ptr, (ROW_TILE_SIZE, 0))
+        grad_o_block_ptr = tl.advance(grad_o_block_ptr, (ROW_TILE_SIZE, 0))
+
+    # Phase C: window-border row blocks (SWA only). Rows past the causal
+    # diagonal but straddling the right window edge.
+    window_border_start = tl.maximum(WINDOW_BORDER_START, start_row_block)
+    for row_block_id in range(window_border_start, num_row_blocks):
+        row_offset = row_block_id * ROW_TILE_SIZE
+        row_indices = row_offset + tl.arange(0, ROW_TILE_SIZE)
+        row_mask = row_indices[:, None] < N_QUERIES
+        Q = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        R = tl.load(r_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        d1 = tl.load(d1_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        bart = tl.load(bart_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        m = tl.load(m_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        t = tl.load(t_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        grad_o = tl.load(grad_o_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        qk = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * qk_scale_log2
+        rk = tl.dot(R, tl.trans(K), out_dtype=tl.float32)
+        inv_d1 = tl.where(row_mask, 1.0 / d1, 0.0)
+        mask = (
+            (col_indices[None, :] >= row_indices[:, None] - WINDOW_SIZE_LEFT + 1)
+            & row_mask
+            & (col_indices[None, :] < N_KEYVALS)
+        )
+        qk = tl.where(mask, qk, -float("inf"))
         w = tl.math.exp2(qk - m)
         p = w * inv_d1
         a = tl.dot(grad_o, tl.trans(V), out_dtype=tl.float32)
@@ -494,6 +619,8 @@ def parallax_bwd(
     m: torch.Tensor,
     grad_o: torch.Tensor,
     qk_scale: float | torch.Tensor,
+    n_rep: int = 1,
+    window_size_left: int = -1,
 ):
     """Parallax backward pass (Triton, training).
 
@@ -502,17 +629,28 @@ def parallax_bwd(
         o, barv, d1, bart, m: tensors returned by :func:`parallax_fwd`.
         grad_o: gradient of the loss w.r.t. ``o``.
         qk_scale: matches the value passed to :func:`parallax_fwd`.
+        n_rep: GQA group size (``H_q // H_kv``). Default 1 = MHA.
+        window_size_left: causal sliding-window length (FA2 convention).
 
     Returns:
         ``(grad_q, grad_r, grad_k, grad_v)`` — bf16 tensors with the same
-        shapes as ``q, r, k, v``.
+        shapes as ``q, r, k, v``. Under GQA the per-q-head dK/dV slots are
+        folded back to the kv-head axis with a sum reduce.
     """
     batch_size, n_queries, head_dim = q.shape
     n_keyvals = k.shape[1]
+    assert batch_size % n_rep == 0
+    kv_batch_size = batch_size // n_rep
+    assert k.shape[0] == kv_batch_size
+
     grad_q = torch.empty_like(q, dtype=torch.bfloat16)
     grad_r = torch.empty_like(r, dtype=torch.bfloat16)
-    grad_k = torch.empty_like(k, dtype=torch.bfloat16)
-    grad_v = torch.empty_like(v, dtype=torch.bfloat16)
+    grad_k_buf = torch.empty(
+        (batch_size, n_keyvals, head_dim), device=q.device, dtype=torch.bfloat16
+    )
+    grad_v_buf = torch.empty(
+        (batch_size, n_keyvals, head_dim), device=q.device, dtype=torch.bfloat16
+    )
 
     t = torch.empty((batch_size, n_queries, 1), device=q.device, dtype=torch.float32)
     b = torch.empty((batch_size, n_queries, 1), device=q.device, dtype=torch.float32)
@@ -549,10 +687,12 @@ def parallax_bwd(
         n_queries,
         n_keyvals,
         head_dim,
+        n_rep,
+        window_size_left,
     )
 
     _bwd_kv_kernel[kv_grid](
-        q, r, k, v, d1, bart, m, t, b, grad_o, grad_k, grad_v,
+        q, r, k, v, d1, bart, m, t, b, grad_o, grad_k_buf, grad_v_buf,
         q.stride(0), q.stride(1), q.stride(2),
         r.stride(0), r.stride(1), r.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
@@ -563,11 +703,22 @@ def parallax_bwd(
         t.stride(0), t.stride(1),
         b.stride(0), b.stride(1),
         grad_o.stride(0), grad_o.stride(1), grad_o.stride(2),
-        grad_k.stride(0), grad_k.stride(1), grad_k.stride(2),
-        grad_v.stride(0), grad_v.stride(1), grad_v.stride(2),
+        grad_k_buf.stride(0), grad_k_buf.stride(1), grad_k_buf.stride(2),
+        grad_v_buf.stride(0), grad_v_buf.stride(1), grad_v_buf.stride(2),
         qk_scale,
         n_queries,
         n_keyvals,
         head_dim,
+        n_rep,
+        window_size_left,
     )
+
+    if n_rep == 1:
+        grad_k = grad_k_buf
+        grad_v = grad_v_buf
+    else:
+        # Fold n_rep per-q-head slots back to the kv-head axis (same sum as
+        # autograd through repeat_kv).
+        grad_k = grad_k_buf.view(kv_batch_size, n_rep, n_keyvals, head_dim).sum(dim=1)
+        grad_v = grad_v_buf.view(kv_batch_size, n_rep, n_keyvals, head_dim).sum(dim=1)
     return grad_q, grad_r, grad_k, grad_v

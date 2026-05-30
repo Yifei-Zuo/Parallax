@@ -1,13 +1,11 @@
 """Benchmark the Parallax SM90 decode kernel against FA2 / (optional) FA3.
 
-Ported from ``flashlla/dev_ops/decode_h200_v4/bench_speed_parallax.py``,
-stripped to the three backends that are publicly comparable in this repo:
+Backends:
 
   - fa-decode     ``flash_attn.flash_attn_with_kvcache``             — FA2 C++ kvcache.
   - fa3-decode    ``flash_attn_interface.flash_attn_with_kvcache``   — FA3 hopper kvcache;
-                                                                       opt-in via ``--include-fa3``
-                                                                       (built from source).
-  - parallax-cute ``parallax.parallax_decode``                       — this repo's SM90 CuTeDSL kernel.
+                                                                       opt-in via ``--include-fa3``.
+  - parallax-cute ``parallax.parallax_decode``                       — the SM90 CuTeDSL kernel.
 
 For every shape this script runs **both** an end-to-end precision pass and a
 speed pass:
@@ -130,7 +128,7 @@ def _l2_flush_buffer():
 
 
 def _time_fn(fn, warmup, iters, trials, l2_flush_buf) -> QStats:
-    """CUDA-graph-replay timing matching the upstream harness.
+    """CUDA-graph-replay timing.
 
     Captures ``iters_in_graph`` back-to-back ``fn()`` calls in a single CUDA
     graph (warm path) or 1 call + L2 flush (cold path), then replays
