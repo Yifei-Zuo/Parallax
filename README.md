@@ -71,8 +71,8 @@ o = parallax_decode(q, r, k, v, qk_scale=1.0 / math.sqrt(D)) # (B, 1, H, D)
 
 ## Benchmark
 
-`scripts/bench_decode.py` benchmarks the decode kernel against FA2 (and
-optionally FA3) with combined speed + precision reporting:
+`scripts/bench_decode.py` benchmarks the decode kernel against FA2 and
+FA3 with combined speed + precision reporting:
 
 ```bash
 python scripts/bench_decode.py                       # example sweep
@@ -81,8 +81,47 @@ python scripts/bench_decode.py --parallax-grid \
                                --csv runs/bench.csv  # 216-shape grid, save to CSV
 ```
 
-For each shape it prints CUDA-graph replay latency (q05/q50/q95) per
-backend and a per-row precision check.
+The numbers below are measured on a single NVIDIA H200 SXM (132 SMs)
+with bf16 inputs and head dimension `D = 128`. Latency is the q50
+over a CUDA-graph replay sweep (`q05` and `q95` are within ±1% on
+every row). Accuracy is the worst per-element relative error against
+the fp32 torch reference (`parallax.parallax_reference`).
+
+**Small batch (B = 1, H = 8, D = 128)**
+
+| L | FA2 (µs) | FA3 (µs) | Parallax (µs) | Parallax max-rel-err |
+|---:|---:|---:|---:|---:|
+|   512 |  8.38 | 10.64 | **5.79** | 2.1e-3 |
+|  1024 |  9.45 |  9.10 | **6.48** | 4.0e-3 |
+|  4096 | 17.07 | 11.90 | **8.61** | 2.0e-3 |
+| 16384 | 29.82 | 24.46 | **21.53** | 2.7e-3 |
+
+**Large batch (B = 32, H = 8, D = 128)**
+
+| L | FA2 (µs) | FA3 (µs) | Parallax (µs) | Parallax max-rel-err |
+|---:|---:|---:|---:|---:|
+|   512 |   27.73 |   **23.48** |    24.02 | 3.6e-3 |
+|  1024 |   99.73 |   **39.16** |    39.55 | 3.4e-3 |
+|  4096 |  384.90 |    281.64  | **279.96** | 3.6e-3 |
+| 16384 | 1574.94 |   1096.76  | **1094.37** | 3.2e-3 |
+
+Reproduce the small-batch table with:
+
+```bash
+python scripts/bench_decode.py --include-fa3 \
+    --shape 1,512,8,128  --shape 1,1024,8,128 \
+    --shape 1,4096,8,128 --shape 1,16384,8,128 \
+    --warmup 100 --iters 50 --trials 20
+```
+
+Reproduce the large-batch table with:
+
+```bash
+python scripts/bench_decode.py --include-fa3 \
+    --shape 32,512,8,128  --shape 32,1024,8,128 \
+    --shape 32,4096,8,128 --shape 32,16384,8,128 \
+    --warmup 100 --iters 50 --trials 20
+```
 
 ## Citation
 
