@@ -6,8 +6,9 @@
 
 This repository provides the official implementation of Parallax from the following paper:
 
-**Parallax: Parameterized Local Linear Attention.**
+**Parallax: Parameterized Local Linear Attention.**</br>
 Yifei Zuo, Dhruv Pai, Zhichen Zeng, Alec Dewulf, Shuming Hu, and Zhaoran Wang.
+arXiv preprint, 2026.
 
 ## Install
 
@@ -75,7 +76,7 @@ optionally FA3) with combined speed + precision reporting:
 python scripts/bench_decode.py                       # example sweep
 python scripts/bench_decode.py --include-fa3         # add the FA3 column
 python scripts/bench_decode.py --parallax-grid \
-                               --csv runs/bench.csv  # 216-shape grid → CSV
+                               --csv runs/bench.csv  # 216-shape grid, save to CSV
 ```
 
 For each shape it prints CUDA-graph replay latency (q05/q50/q95) per

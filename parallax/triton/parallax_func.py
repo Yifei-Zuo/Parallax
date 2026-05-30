@@ -45,10 +45,6 @@ def parallax_func(q: torch.Tensor,
                   qk_scale: float | None = None) -> torch.Tensor:
     """Causal Parallax attention with autograd, backed by Triton kernels.
 
-    Shape convention follows :func:`torch.nn.functional.scaled_dot_product_attention`
-    — heads as the second axis. Heads are folded into the batch dimension
-    internally before the kernel call and unfolded on return.
-
     Args:
         q, r: ``(B, H, L_q, D)`` bf16 or fp16 tensors.
         k, v: ``(B, H, L_kv, D)`` tensors with the same dtype as ``q``.
