@@ -111,7 +111,9 @@ def _bwd_preprocess_kernel(
 
 
 @triton.autotune(
-    configs=_CONFIGS,
+    # Fresh list per autotuner — sharing one list across two @triton.autotune
+    # decorators trips Dynamo ("ListVariable already tracked for mutation").
+    configs=list(_CONFIGS),
     key=["N_QUERIES", "N_KEYVALS", "HEAD_DIM", "N_REP", "WINDOW_SIZE_LEFT"],
     prune_configs_by={"early_config_prune": _prune_bwd_configs_by_head_dim},
 )
@@ -331,7 +333,9 @@ def _bwd_rq_kernel(
 
 
 @triton.autotune(
-    configs=_CONFIGS,
+    # Fresh list per autotuner — sharing one list across two @triton.autotune
+    # decorators trips Dynamo ("ListVariable already tracked for mutation").
+    configs=list(_CONFIGS),
     key=["N_QUERIES", "N_KEYVALS", "HEAD_DIM", "N_REP", "WINDOW_SIZE_LEFT"],
     prune_configs_by={"early_config_prune": _prune_bwd_configs_by_head_dim},
 )
