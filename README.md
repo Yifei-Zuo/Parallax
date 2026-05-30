@@ -6,9 +6,11 @@
 
 This repository provides the official implementation of Parallax from the following paper:
 
-**Parallax: Parameterized Local Linear Attention.**</br>
-Yifei Zuo, Dhruv Pai, Zhichen Zeng, Alec Dewulf, Shuming Hu, and Zhaoran Wang.
-arXiv preprint, 2026.
+> **Parallax: Parameterized Local Linear Attention.**</br>
+> Yifei Zuo, Dhruv Pai, Zhichen Zeng, Alec Dewulf, Shuming Hu, and Zhaoran Wang.
+> arXiv preprint, 2026.
+
+Parallax is an upgrade to Softmax Attention. It is a scalable form of Local Linear Attention (LLA), a mechanism with provable theoretical advantages over Softmax Attention (see [FlashLLA](https://github.com/Yifei-Zuo/FlashLLA) for the LLA kernels). Parallax and LLA are **not** linear complexity attention mechanisms. They share the computational structure of Softmax Attention and require KV cache for decoding. Optimizations such as sliding window and block-sparsity are structurally compatible with Parallax.
 
 ## Install
 
