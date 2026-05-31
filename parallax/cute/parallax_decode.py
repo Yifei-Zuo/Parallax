@@ -13,29 +13,30 @@ reduction-epilogue kernel.
 Warp specialization (one producer warpgroup issuing TMA loads of
 K_c / V_c tiles into shared memory, one consumer warpgroup driving
 the QK and PV WGMMA pipeline plus the online softmax) follows the
-FlashAttention 3 CuTeDSL kernel referenced above. Parallax extends
-that streaming structure with one extra GEMM (R_r * K_c^T) and one
-extra weighted PV accumulation (P_2 * V_c) per tile, both packed
-into the same WGMMA pair that already produces FlashAttention's
-S_1 = Q_r * K_c^T * s and O_1 = sum_j P_1_j * V_j. The two
-branches share their K_c, V_c reads, the online-softmax max, and
-the rescaling factor, so the covariance branch costs zero extra
-HBM traffic and one extra row of register accumulators per CTA.
+FlashAttention 3 CuTeDSL kernel referenced above. Parallax packs
+R_r alongside Q_r as row 1 of the shared-memory A operand, so the
+same QK WGMMA emits both S_1 = Q_r * K_c^T * s (row 0) and
+S_2 = R_r * K_c^T (row 1) into acc_QR; the PV WGMMA likewise emits
+both O_1 = sum_j P_1_j * V_j (row 0) and O_2 = sum_j P_2_j * V_j
+(row 1) into acc_O. The two branches share K_c / V_c reads, the
+online-softmax max, and the rescaling factor — zero extra HBM
+traffic and one extra register-accumulator row per CTA versus FA.
 
-Variable names inside this file follow Algorithm 1 of the paper
-directly (Q_r, R_r, K, V, S_1, S_2, P_1, P_2, m_r, alpha, d_1,
-d_2, O_1, O_2, B_c, s); a short variable mapping table is provided
-below.
+Public entry point:
+``parallax_decode(q, r, k, v, qk_scale, *, window_size_left=-1, out=None)``.
 
-Public entry point: ``parallax_decode(q, r, k, v, qk_scale, out=None)``.
+``window_size_left`` follows the FA2 convention: ``-1`` (default)
+disables SWA; ``>= 0`` restricts the decode query to the most recent
+``window_size_left`` keys. When SWA is active the split-K range is
+re-allocated over the in-window tiles only, so out-of-window tiles
+are never loaded by any CTA.
 
 Restrictions:
   * SM90 (H100 / H200) only
   * bf16 or fp16 input
-  * seqlen_q = 1 (decoding only)
+  * seqlen_q = 1
   * head_dim in {64, 128}
-  * kv_len can be any positive integer; the last tile is masked when
-    kv_len is not a multiple of B_c = 64
+  * kv_len can be any positive integer
 """
 
 from __future__ import annotations
@@ -137,16 +138,11 @@ class ParallaxDecodePersistentSplit:
         self.head_dim_padded = int(math.ceil(head_dim / 16) * 16)
         self.m_block_size = 64
         self.n_block_size = n_block_size
-        self.num_stages = 2  # was 3; reduced to 2 to close a producer-consumer
-        # pipeline race that caused ~10% of calls on large-BH × mid-K × D=128
-        # shapes to have ONE random (B, H) row computed with a stale K-tile
-        # (max output diff ~0.2-0.8 vs output norm ~3-10). At num_stages=3
-        # the producer can get 3 K/V tiles ahead of the consumer and the
-        # `PipelineTmaAsyncNoCluster` mbarrier protocol intermittently flips
-        # the stage barrier before TMA fully commits to SMEM. num_stages=2
-        # drops the affected-shape count from 10/83 → 2/83 in the sweep and
-        # has zero measurable speed cost on H200 (graph-replay kernel time
-        # identical within ±0.3 µs).
+        # num_stages=2: with 3+ stages the producer can race ahead of the
+        # consumer and `PipelineTmaAsyncNoCluster` can flip the stage barrier
+        # before TMA fully commits to SMEM, yielding stale K-tile reads on a
+        # small fraction of (B, H) rows.
+        self.num_stages = 2
         self.num_threads = 256
         self.num_threads_per_warp_group = 128
         self.debug_stage = debug_stage
@@ -213,6 +209,7 @@ class ParallaxDecodePersistentSplit:
         softmax_scale_log2: Float32,
         stream: cuda.CUstream,
         num_k_splits: cutlass.Constexpr[int] = 1,
+        window_size_left: cutlass.Constexpr[int] = -1,
     ):
         mK_tma, mV_tma = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0]))
@@ -279,6 +276,7 @@ class ParallaxDecodePersistentSplit:
             tiled_mma_pv,
             SharedStorage,
             num_k_splits,
+            window_size_left,
         ).launch(
             grid=[cute.size(mQ.shape[0]), cute.size(mQ.shape[2]), num_k_splits],
             block=[self.num_threads, 1, 1],
@@ -312,6 +310,7 @@ class ParallaxDecodePersistentSplit:
         tiled_mma_pv: cute.TiledMma,
         SharedStorage: cutlass.Constexpr[Callable],
         num_k_splits: cutlass.Constexpr[int],
+        window_size_left: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         batch_idx, head_idx, k_split_id = cute.arch.block_idx()
@@ -332,13 +331,24 @@ class ParallaxDecodePersistentSplit:
         # a clean multiple). The mask is applied only when this
         # constexpr is strictly less than B_c (see _apply_last_tile_mask
         # call sites).
+        # Split-K is allocated over the *valid* tile range
+        # [first_valid_tile, tiles_total). For SWA (window_size_left >= 0)
+        # the first window_start_kv KV positions sit outside the window and
+        # never need to be loaded by any CTA; first_valid_tile = 0 when
+        # window_size_left < 0 so the no-SWA fast path is preserved
+        # bit-for-bit.
         tiles_total: cutlass.Constexpr[int] = (kv_len + self.n_block_size - 1) // self.n_block_size
-        tiles_per_split: cutlass.Constexpr[int] = (tiles_total + num_k_splits - 1) // num_k_splits
         valid_n_last_tile: cutlass.Constexpr[int] = kv_len - (tiles_total - 1) * self.n_block_size
-        k_start_tile = k_split_id * tiles_per_split
+        window_start_kv: cutlass.Constexpr[int] = (
+            max(0, kv_len - window_size_left) if window_size_left >= 0 else 0
+        )
+        first_valid_tile: cutlass.Constexpr[int] = window_start_kv // self.n_block_size
+        valid_tiles_total: cutlass.Constexpr[int] = tiles_total - first_valid_tile
+        tiles_per_split: cutlass.Constexpr[int] = (valid_tiles_total + num_k_splits - 1) // num_k_splits
+        k_start_tile = Int32(first_valid_tile) + k_split_id * tiles_per_split
         k_end_tile_uncapped = k_start_tile + tiles_per_split
-        # Cap the last split at tiles_total when tiles_total is not a multiple of
-        # tiles_per_split. cute.arch.min handles the runtime min.
+        # Cap the last split at tiles_total when valid_tiles_total is not a
+        # multiple of tiles_per_split.
         k_end_tile = cutlass.min(k_end_tile_uncapped, Int32(tiles_total))
 
         smem = cutlass.utils.SmemAllocator()
@@ -368,8 +378,9 @@ class ParallaxDecodePersistentSplit:
             tx_count=self.tma_copy_v_bytes,
         )
 
-        # Q/R fill + barrier moved inside the consumer branch so the producer warpgroup
-        # can start TMA loads immediately instead of waiting on an all-block barrier.
+        # Q/R fill + barrier live inside the consumer branch so the producer
+        # warpgroup can start TMA loads immediately rather than waiting on an
+        # all-block barrier.
         mK_cur = mK[None, None, head_idx, batch_idx]
         mV_cur = mV[None, None, head_idx, batch_idx]
         gK = cute.local_tile(mK_cur, (self.n_block_size, self.head_dim_padded), (None, 0))
@@ -426,6 +437,7 @@ class ParallaxDecodePersistentSplit:
                 kv_len,
                 softmax_scale_log2,
                 num_k_splits,
+                window_size_left,
                 k_start_tile,
                 k_end_tile,
             )
@@ -496,16 +508,27 @@ class ParallaxDecodePersistentSplit:
         kv_len: cutlass.Constexpr[int],
         softmax_scale_log2: Float32,
         num_k_splits: cutlass.Constexpr[int],
+        window_size_left: cutlass.Constexpr[int],
         k_start_tile: Int32,
         k_end_tile: Int32,
     ) -> None:
-        # Re-derive the constexpr partial-last-tile bookkeeping (also computed in
-        # the outer @cute.kernel scope but not visible here): tiles_total counts
-        # tiles via ceil-div so kv_len need not be a multiple of B_c; the last
-        # tile may have fewer than B_c valid columns, captured by
-        # `valid_n_last_tile` in [1, B_c].
+        # Re-derive partial-last-tile + sliding-window constexprs that the
+        # outer @cute.kernel scope computes but cannot share across this
+        # function boundary. tiles_total uses ceil-div so kv_len need not
+        # be a multiple of B_c; the last tile may have fewer than B_c
+        # valid columns, captured by valid_n_last_tile in [1, B_c].
+        # window_size_left == -1 disables SWA; otherwise the query at
+        # position kv_len - 1 attends only to KV positions in
+        # [window_start_kv, kv_len). first_valid_tile is the lowest tile
+        # index with any valid columns; first_tile_skip is the count of
+        # leading invalid columns inside that tile (range [0, B_c)).
         tiles_total: cutlass.Constexpr[int] = (kv_len + self.n_block_size - 1) // self.n_block_size
         valid_n_last_tile: cutlass.Constexpr[int] = kv_len - (tiles_total - 1) * self.n_block_size
+        window_start_kv: cutlass.Constexpr[int] = (
+            max(0, kv_len - window_size_left) if window_size_left >= 0 else 0
+        )
+        first_valid_tile: cutlass.Constexpr[int] = window_start_kv // self.n_block_size
+        first_tile_skip: cutlass.Constexpr[int] = window_start_kv - first_valid_tile * self.n_block_size
 
         wg_layout = cute.make_layout(1, stride=self.num_threads_per_warp_group)
         wg_mma_qk = tiled_mma_qk.get_slice(wg_layout(0))
@@ -1073,6 +1096,13 @@ class ParallaxDecodePersistentSplit:
             valid_n_iter0 = Int32(valid_n_last_tile) if k_start_tile == tiles_total - 1 else Int32(self.n_block_size)
             self._apply_last_tile_mask(acc_QR, tiled_mma_qk, valid_n_iter0)
 
+        # Mask the first valid tile's leading out-of-window columns when
+        # the sliding-window left boundary does not align to B_c. const_expr
+        # branch elides when first_tile_skip == 0 (no SWA or aligned).
+        if const_expr(first_tile_skip > 0):
+            skip_n_iter0 = Int32(first_tile_skip) if k_start_tile == first_valid_tile else Int32(0)
+            self._apply_first_tile_skip_mask(acc_QR, tiled_mma_qk, skip_n_iter0)
+
         m_r, d1, d2, _alpha0 = self._row0_online_softmax_and_make_p(
             acc_QR,
             tiled_mma_qk,
@@ -1123,6 +1153,10 @@ class ParallaxDecodePersistentSplit:
                 valid_n_t = Int32(valid_n_last_tile) if t == tiles_total - 1 else Int32(self.n_block_size)
                 self._apply_last_tile_mask(acc_QR, tiled_mma_qk, valid_n_t)
 
+            if const_expr(first_tile_skip > 0):
+                skip_n_t = Int32(first_tile_skip) if t == first_valid_tile else Int32(0)
+                self._apply_first_tile_skip_mask(acc_QR, tiled_mma_qk, skip_n_t)
+
             m_r, d1, d2, alpha = self._row0_online_softmax_and_make_p(
                 acc_QR,
                 tiled_mma_qk,
@@ -1154,16 +1188,13 @@ class ParallaxDecodePersistentSplit:
 
         # Finalize: two paths, picked at JIT time on num_k_splits.
         #
-        # **num_k_splits == 1 (short-K / SM-saturated grid)**: this CTA owns
-        # the entire (B, H) row by itself, so it just casts in-register and
-        # writes the bf16/fp16 row to mO directly via `_finalize_and_store`.
-        # No HBM workspace round-trip, no fence, no atomic, no merge. This
-        # is the same code path v1 (clla-cute) uses and matches its short-K
-        # latency. (~1-2 µs saved per call.)
+        # num_k_splits == 1: this CTA owns the entire (B, H) row, so it
+        # casts in-register and writes the bf16/fp16 row directly to mO.
+        # No HBM workspace round-trip, no fence, no atomic, no merge.
         #
-        # **num_k_splits > 1 (split-K / narrow-batch long-K)**: every CTA
-        # writes per-CTA un-normalized fp32 partials to HBM workspace,
-        # then atomic-last-CTA-wins picks the merger:
+        # num_k_splits > 1: every CTA writes per-CTA un-normalized fp32
+        # partials to HBM workspace, then atomic-last-CTA-wins picks the
+        # merger:
         #   1. consumer-warpgroup-barrier (all 128 threads finished writes)
         #   2. fence_acq_rel_gpu — publish partial writes to peer CTAs
         #   3. tidx==0 atomic_add(counter[B, H], 1) returns OLD; the CTA
@@ -1319,6 +1350,32 @@ class ParallaxDecodePersistentSplit:
                 acc_mn[r0, c_i] = -Float32.inf
 
     @cute.jit
+    def _apply_first_tile_skip_mask(
+        self,
+        acc_qr: cute.Tensor,
+        tiled_mma_qk: cute.TiledMma,
+        skip_n: Int32,
+    ) -> None:
+        """Set S_1 to -inf for the first ``skip_n`` columns of the tile (row 0 only).
+
+        Sliding-window dual of ``_apply_last_tile_mask``: the lowest
+        valid tile may cover positions both inside and outside the
+        sliding window, with the in-window positions at the *high* end
+        of the tile. We mask the low end (positions before the window)
+        and let the softmax see the rest. Same row-0-only contract as
+        the last-tile mask to avoid 0 * -inf NaNs in the composite
+        branch.
+        """
+        acc_mn = utils.make_acc_tensor_mn_view(acc_qr)
+        thr_mma = tiled_mma_qk.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
+        cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+        cS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS))
+        r0 = 0
+        for c_i in cutlass.range(cute.size(acc_mn, mode=[1]), unroll_full=True):
+            if cS_mn[r0, c_i][0] == 0 and cS_mn[r0, c_i][1] < skip_n:
+                acc_mn[r0, c_i] = -Float32.inf
+
+    @cute.jit
     def _scale_output_rows01(self, acc: cute.Tensor, alpha: Float32, tiled_mma: cute.TiledMma) -> None:
         acc_mn = utils.make_acc_tensor_mn_view(acc)
         thr_mma = tiled_mma.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
@@ -1364,13 +1421,11 @@ class ParallaxDecodePersistentSplit:
         tidx = cute.arch.thread_idx()[0] - self.num_threads_per_warp_group
         # Scalar partials: one writer per CTA (lane 0 of warp 0 holds the
         # canonical reduced value because width=8 warp_reduce broadcasts
-        # within the first 8 lanes of warp 0 -- lane 0 is included).
-        # The kernel carries m_r in raw QK units (unscaled). The
-        # Triton epilogue uses tl.exp for the log-sum-exp weight, so we
-        # rescale m_r into "natural-base" units (matches the PyTorch
-        # reference's m = (qk * qk_scale).max()). With qk_scale =
-        # softmax_scale_log2 * ln(2), the conversion is m_r * scale_log2
-        # * ln2.
+        # within the first 8 lanes of warp 0). The kernel carries m_r in
+        # raw QK units (unscaled); rescale into natural-base (matching
+        # the fp32 reference's m = (qk * qk_scale).max()) so the
+        # cross-split exp() merge in `_merge_and_store_inkernel` uses the
+        # same units as the per-split d1/d2 partials.
         _LN2 = Float32(0.6931471805599453)
         # All partials writes go via `st.global.cg.f32` (cache-global) so
         # the data bypasses L1 and lands in L2 — peer CTAs reading via
@@ -1423,11 +1478,9 @@ class ParallaxDecodePersistentSplit:
                 O1_d = acc_mn[r0, c_i] * inv_d1
                 O2_d = O2_from_row1 * inv_d1
                 o_fp32 = O1_d + c_norm * O1_d - O2_d
-                # Cast to mO's element type (bf16/fp16 from the caller, or
-                # fp32 if mO is the legacy internal buffer). Doing the
-                # cancellation in fp32 and casting at the store preserves
-                # the precision lever — same pattern as the fused-merge
-                # path's `_merge_and_store_inkernel`.
+                # Run the composite cancellation in fp32, cast at the
+                # store — the bf16/fp16 cast on (O1 + c*O1 - O2) keeps
+                # more precision than casting the per-term inputs first.
                 mO[batch_idx, 0, head_idx, cO_mn[r0, c_i][1]] = mO.element_type(o_fp32)
 
     @cute.jit
@@ -1473,11 +1526,10 @@ class ParallaxDecodePersistentSplit:
         cute.arch.fence_acq_rel_gpu()
         if tidx == 0:
             counter_ptr = utils.elem_pointer(mWs_counter, (batch_idx, head_idx))
-            # Inline PTX `atom.acq_rel.gpu.global.add.u32` — proper acq_rel
-            # ordering. The previous nvvm.atomicrmw without mem_order
-            # defaulted to LLVM "monotonic" (relaxed) and did not establish
-            # a sync-with relationship with the prior fence, so peer CTAs
-            # could observe the increment without observing the partials.
+            # Inline PTX `atom.acq_rel.gpu.global.add.u32`: the acq_rel
+            # ordering establishes a sync-with relationship with the
+            # prior fence so peer CTAs that observe our increment also
+            # observe our partials.
             old = _atom_acq_rel_gpu_add_u32(counter_ptr)
             is_last = old == Int32(num_k_splits - 1)
             sStats[0] = Float32(1.0) if is_last else Float32(0.0)
@@ -1523,15 +1575,14 @@ class ParallaxDecodePersistentSplit:
         tidx: Int32,
         num_k_splits: cutlass.Constexpr[int],
     ) -> None:
-        # Port of `reduction_epilogue` from Triton to CuTe DSL. Each of the
-        # 128 consumer threads handles ONE output column (if tidx<head_dim).
-        # Scalars (m, d1, d2) are read by every thread — that's NUM_K_SPLITS
-        # * 3 redundant HBM reads but they're all L2-cached (we just wrote
-        # them) and broadcast-friendly. The per-column O1/O2 reads are
-        # unique per thread.
+        # Streaming final reduction (Algorithm 1, cross-split). Each of
+        # the 128 consumer threads handles ONE output column (if
+        # tidx < head_dim). Scalars (m, d1, d2) are read by every thread
+        # — that's num_k_splits * 3 redundant HBM reads but they're all
+        # L2-cached (we just wrote them) and broadcast-friendly.
         #
-        # Math (Algorithm 1 streaming final reduction):
-        #   m_global  = max_s m_s                       (stored in natural-base)
+        # Math:
+        #   m_global  = max_s m_s                       (natural-base)
         #   w[s]      = exp(m_s - m_global)
         #   d1_global = Σ_s d1_s * w[s]
         #   d2_global = Σ_s d2_s * w[s]
@@ -1573,10 +1624,7 @@ class ParallaxDecodePersistentSplit:
             O1_d = O1_acc * inv_d1
             O2_d = O2_acc * inv_d1
             o_fp32 = O1_d + c_norm * O1_d - O2_d
-            # Cast to mO's element type (bf16 / fp16 on the fused path,
-            # fp32 if we ever pass mO=internal-fp32-buffer). Doing the
-            # cancellation in fp32 and the cast at the store is the same
-            # precision pattern as the Triton epilogue.
+            # Run the composite cancellation in fp32, cast at the store.
             mO[batch_idx, 0, head_idx, tidx] = mO.element_type(o_fp32)
 
 
@@ -1585,11 +1633,10 @@ def _to_cute_tensor(t: torch.Tensor):
 
 
 def _cached_cute_tensor(t: torch.Tensor):
-    """from_dlpack wrapper + memoization keyed on the tensor's data pointer, shape, dtype.
-    The first-seen torch.Tensor is strong-ref'd in the cache so the underlying memory
-    outlives the returned cute tensor view. For the benchmark harness this bounds the
-    cache to ~O(#tensors in CASES * #input slots) = O(16) and is fair versus triton's
-    DecodeContext which pre-allocates and retains its tensors.
+    """from_dlpack wrapper + memoization keyed on (data_ptr, shape, dtype).
+
+    The first-seen torch.Tensor is strong-ref'd in the cache so the
+    underlying memory outlives the returned cute tensor view.
     """
     key = (t.data_ptr(), tuple(t.shape), t.dtype)
     entry = _cute_input_cache.get(key)
@@ -1610,6 +1657,7 @@ def parallax_decode_cutedsl_sm90(
     debug_stage: int = 0,
     ws: dict | None = None,
     num_k_splits: int = 1,
+    window_size_left: int = -1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if q.ndim != 4 or q.shape[1] != 1:
@@ -1684,8 +1732,10 @@ def parallax_decode_cutedsl_sm90(
     ws_counter_t = _cached_cute_tensor(ws_use["counter"])
 
     # out.dtype is in the cache key because the kernel specializes the
-    # final fp32 → mO.element_type cast.
-    key = (q.dtype, out.dtype, head_dim, kv_len, q.shape[0], q.shape[2], debug_stage, num_k_splits)
+    # final fp32 → mO.element_type cast; window_size_left changes the
+    # constexpr SWA tile-mask + split-K allocation, so it must be keyed too.
+    key = (q.dtype, out.dtype, head_dim, kv_len, q.shape[0], q.shape[2],
+           debug_stage, num_k_splits, window_size_left)
     if key not in _compile_cache:
         _compile_cache[key] = cute.compile(
             kernel,
@@ -1693,6 +1743,7 @@ def parallax_decode_cutedsl_sm90(
             ws_m_t, ws_d1_t, ws_d2_t, ws_O1_t, ws_O2_t, ws_counter_t,
             kv_len, scale_log2, stream,
             num_k_splits,
+            window_size_left,
         )
     _compile_cache[key](
         q_t, r_t, k_t, v_t, out_t,
@@ -1805,6 +1856,7 @@ def parallax_decode(q: torch.Tensor,
                     v: torch.Tensor,
                     qk_scale: float,
                     *,
+                    window_size_left: int = -1,
                     out: torch.Tensor | None = None) -> torch.Tensor:
     """Parallax forward decode on NVIDIA Hopper.
 
@@ -1812,6 +1864,9 @@ def parallax_decode(q: torch.Tensor,
         q, r: ``(B, 1, H, D)`` bf16 or fp16, matching dtypes.
         k, v: ``(B, L, H, D)`` same dtype as q.
         qk_scale: typically ``1 / sqrt(D)``.
+        window_size_left: causal sliding-window length (FA2 convention).
+            ``-1`` (default) disables; ``>= 0`` restricts the decode query
+            to the most recent ``window_size_left`` keys.
         out: optional output tensor; if provided must match
             ``(B, 1, H, D)`` and the dtype of q.
 
@@ -1834,9 +1889,23 @@ def parallax_decode(q: torch.Tensor,
     kv_len = k.shape[1]
     num_bh = B * H
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    num_k_splits = _choose_num_k_splits(num_bh, kv_len, num_sms)
+
+    # SWA reduces the effective tile range to [first_valid_tile, tiles_total).
+    # Compute valid-tile count so the split picker doesn't allocate more
+    # splits than there are tiles to assign.
+    tiles_total = (kv_len + 63) // 64
+    if window_size_left >= 0:
+        window_start_kv = max(0, kv_len - window_size_left)
+        first_valid_tile = window_start_kv // 64
+    else:
+        first_valid_tile = 0
+    valid_tiles_total = max(1, tiles_total - first_valid_tile)
+    effective_kv_len = valid_tiles_total * 64
+
+    num_k_splits = _choose_num_k_splits(num_bh, effective_kv_len, num_sms)
     if num_k_splits > 1:
         num_k_splits = _round_to_pow2_wave_aware(num_k_splits, num_bh, num_sms)
+    num_k_splits = min(num_k_splits, valid_tiles_total)
 
     if out is None:
         out = _get_output_buffer(B, H, D, q.device, q.dtype)
@@ -1850,6 +1919,7 @@ def parallax_decode(q: torch.Tensor,
 
     ws = _get_workspace(num_bh, num_k_splits, D, q.device)
     parallax_decode_cutedsl_sm90(
-        q, r, k, v, qk_scale, ws=ws, num_k_splits=num_k_splits, out=out,
+        q, r, k, v, qk_scale, ws=ws, num_k_splits=num_k_splits,
+        window_size_left=window_size_left, out=out,
     )
     return out
