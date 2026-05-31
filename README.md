@@ -25,7 +25,7 @@ pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
 pip install -e .
 ```
 
-For the bench harness (adds the FA2 baseline + `rich` Live table):
+For the bench harness:
 
 ```bash
 uv sync --extra bench
