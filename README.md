@@ -21,11 +21,11 @@ cd Parallax
 uv sync
 
 # Or with pip:
-pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
 pip install -e .
 ```
 
-For the bench harness:
+For the bench harness (adds the FA2 baseline + `rich` Live table):
 
 ```bash
 uv sync --extra bench
