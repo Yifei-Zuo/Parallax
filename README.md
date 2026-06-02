@@ -18,17 +18,27 @@ Parallax is an upgrade to Softmax Attention. It is a scalable form of Local Line
 git clone https://github.com/Yifei-Zuo/Parallax.git
 cd Parallax
 
+# Training only (Triton + reference)
 uv sync
-
 # Or with pip:
 pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
 pip install -e .
 ```
 
-For the bench harness (adds the FA2 baseline + `rich` Live table):
+Add the SM90 decode kernels:
+
+```bash
+uv sync --extra decode
+# Or with pip:
+pip install -e '.[decode]'
+```
+
+For the bench harness:
 
 ```bash
 uv sync --extra bench
+# Or with pip:
+pip install -e '.[bench]'
 ```
 
 ## Quickstart

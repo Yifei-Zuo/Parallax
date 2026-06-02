@@ -24,17 +24,32 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+# Core deps are everything the Triton training path needs. The cute-based
+# SM90 decode / prefill kernels live behind the [decode] extra so a clone
+# of this repo aimed at training does not have to install the cutlass-dsl
+# stack (~200MB of nvidia-* wheels + a Hopper-only constraint).
 dependencies = [
     "torch==2.9.1",
     "triton==3.5.1",
-    "nvidia-cutlass-dsl==4.1.0",
-    "nvidia-cutlass-dsl-libs-base",
     "numpy",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
-bench = ["psutil", "rich>=13", "flash_attn>=2.8.3"]
+# Cute-based SM90 kernels (parallax_decode, parallax_prefill). Hopper only.
+decode = [
+    "nvidia-cutlass-dsl==4.1.0",
+    "nvidia-cutlass-dsl-libs-base",
+]
+# The bench harness compares the decode kernel against FA2 and runs the
+# parity tests, so it pulls the [decode] stack plus flash_attn + pytest.
+bench = [
+    "psutil",
+    "rich>=13",
+    "flash_attn>=2.8.3",
+    "pytest>=7",
+    "nvidia-cutlass-dsl==4.1.0",
+    "nvidia-cutlass-dsl-libs-base",
+]
 
 [project.urls]
 Homepage = "https://github.com/Yifei-Zuo/Parallax"
