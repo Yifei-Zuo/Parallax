@@ -12,6 +12,8 @@ This repository provides the official implementation of Parallax from the follow
 
 Parallax is an upgrade to Softmax Attention. It is a scalable form of Local Linear Attention (LLA), a mechanism with provable theoretical advantages over Softmax Attention (see [FlashLLA](https://github.com/Yifei-Zuo/FlashLLA) for the LLA kernels). Parallax and LLA are **not** linear complexity attention mechanisms. They share the computational structure of Softmax Attention and require KV cache for decoding. Optimizations such as sliding window and block-sparsity are structurally compatible with Parallax.
 
+Try Parallax in Modded-NanoGPT: [https://github.com/Yifei-Zuo/modded-nanogpt-plx](https://github.com/Yifei-Zuo/modded-nanogpt-plx/tree/master/parallax)
+
 ## Install
 
 ```bash
