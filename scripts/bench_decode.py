@@ -74,6 +74,7 @@ from _test_utils import (  # noqa: E402
 )
 
 from parallax import parallax_decode, parallax_reference  # noqa: E402
+from parallax.triton import parallax_decode as parallax_decode_triton  # noqa: E402
 
 
 # ── References ──────────────────────────────────────────────────────────
@@ -247,6 +248,11 @@ def bench_one(batch, kv_len, nheads, head_dim, *, warmup, iters, trials,
             lambda: parallax_decode(q, r, k, v, scale),
             ref_plx,
         )
+        errs["parallax-triton"] = _probe_err(
+            "parallax-triton",
+            lambda: parallax_decode_triton(q, r, k, v, scale),
+            ref_plx,
+        )
         del ref_std, ref_plx
     torch.cuda.synchronize()
 
@@ -269,6 +275,10 @@ def bench_one(batch, kv_len, nheads, head_dim, *, warmup, iters, trials,
     fn_plx = lambda: parallax_decode(q, r, k, v, scale)
     results["parallax-cute"] = _try_time("parallax-cute", fn_plx,
                                          warmup, iters, trials, buf, error_log)
+
+    fn_plx_tri = lambda: parallax_decode_triton(q, r, k, v, scale)
+    results["parallax-triton"] = _try_time("parallax-triton", fn_plx_tri,
+                                           warmup, iters, trials, buf, error_log)
 
     return results, errs
 
@@ -317,13 +327,15 @@ def _make_table(backends, mode_str):
     for col in ("B", "K", "H", "D"):
         t.add_column(col, justify="right", style="dim", no_wrap=True)
     pretty = {
-        "fa-decode":     "FA2 (ms)",
-        "fa3-decode":    "FA3 (ms)",
-        "parallax-cute": "PLX (ms)",
+        "fa-decode":       "FA2 (ms)",
+        "fa3-decode":      "FA3 (ms)",
+        "parallax-cute":   "PLX (ms)",
+        "parallax-triton": "PLX-T (ms)",
     }
     for b in backends:
         t.add_column(pretty[b], justify="right", no_wrap=True)
     t.add_column("PLX rel-err", justify="right", no_wrap=True)
+    t.add_column("PLX-T rel-err", justify="right", no_wrap=True)
     return t
 
 
@@ -362,6 +374,7 @@ def main():
     if args.include_fa3:
         backends.append("fa3-decode")
     backends.append("parallax-cute")
+    backends.append("parallax-triton")
 
     console = Console()
     cache_mode = "cold" if args.l2_flush else "warm"
@@ -399,6 +412,8 @@ def main():
             fastest = _fastest_backend(res, backends)
             plx_err_q50 = errs.get("parallax-cute", (float("nan"),) * 8)[3]
             err_cell = f"[{_err_style(plx_err_q50)}]{plx_err_q50:.2e}[/]"
+            plxt_err_q50 = errs.get("parallax-triton", (float("nan"),) * 8)[3]
+            err_cell_t = f"[{_err_style(plxt_err_q50)}]{plxt_err_q50:.2e}[/]"
 
             row = [str(b), str(k), str(h), str(d)]
             for backend in backends:
@@ -409,6 +424,7 @@ def main():
                     cell = f"[dim]{cell}[/dim]"
                 row.append(cell)
             row.append(err_cell)
+            row.append(err_cell_t)
             table.add_row(*row)
 
             for backend in backends:
