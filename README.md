@@ -1,18 +1,27 @@
 # Parallax: Parameterized Local Linear Attention
 
-[![arXiv](https://img.shields.io/badge/arXiv-2605.29157-b31b1b.svg)](https://arxiv.org/abs/2605.29157)
-[![HF Papers](https://img.shields.io/badge/HuggingFace-Papers-FFD21E.svg)](https://huggingface.co/papers/2605.29157)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![arXiv](https://img.shields.io/badge/-arXiv-000000.svg?logo=arxiv&logoColor=b31b1b)](https://arxiv.org/abs/2605.29157)
+[![HF Papers](https://img.shields.io/badge/-Huggingface-000000.svg?logo=huggingface&logoColor=FFD21E)](https://huggingface.co/papers/2605.29157)
+[![X](https://img.shields.io/badge/-Post-000000.svg?logo=x&logoColor=white)](https://x.com/YifeiZuoX/status/2060499152791077082)
+[![Blog](https://img.shields.io/badge/-Blog-000000.svg?logo=data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSItMSAtMSAzNCAzNSIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBkPSJNMjIuNTk3NCAxNi42MjJMMjkuMTczMSAxMi4zNjYxQzI5Ljk0NTkgMTEuODY1NyAzMC45NzczIDEyLjA4NjQgMzEuNDc3OCAxMi44NTkyQzMxLjk3ODMgMTMuNjMyMSAzMS43NTc1IDE0LjY2MzQgMzAuOTg0NyAxNS4xNjM5TDIzLjA0MzQgMjAuMzA3NEw5LjUxODczIDE1LjU5OTRMMi41Mzk0MSAxOS44ODU2QzEuNzU0OTkgMjAuMzY3MiAwLjcyODgwOSAyMC4xMjIgMC4yNDY4NTcgMTkuMzM3OEMtMC4yMzQ5MjMgMTguNTUzMiAwLjAwOTk0MTI2IDE3LjUyNTYgMC43OTQ1ODIgMTcuMDQzOEw5LjEyMjczIDExLjkzMDdMMjIuNTk3NCAxNi42MjJaIiBmaWxsPSIjRjNGM0Y0Ii8%2BPHBhdGggZD0iTTIyLjU5NzQgNC42OTEzMkwyOS4xNzMxIDAuNDM1NDQ5QzI5Ljk0NTkgLTAuMDY1MDA5NSAzMC45NzczIDAuMTU1NzQxIDMxLjQ3NzggMC45Mjg1NTNDMzEuOTc4MyAxLjcwMTQxIDMxLjc1NzUgMi43MzI3OCAzMC45ODQ3IDMuMjMzMjVMMjMuMDQzNCA4LjM3NjdMOS41MTg3MyAzLjY2ODY5TDIuNTM5NDEgNy45NTQ5MUMxLjc1NDk5IDguNDM2NTUgMC43Mjg4MDkgOC4xOTEyOSAwLjI0Njg1NyA3LjQwNzE4Qy0wLjIzNDkyMyA2LjYyMjU0IDAuMDA5OTQxMjYgNS41OTQ4OSAwLjc5NDU4MiA1LjExMzExTDkuMTIyNzMgMEwyMi41OTc0IDQuNjkxMzJaIiBmaWxsPSIjRjNGM0Y0Ii8%2BPHBhdGggZD0iTTIyLjU5NzQgMjguNTUzNkwyOS4xNzMxIDI0LjI5NzhDMjkuOTQ1OSAyMy43OTczIDMwLjk3NzMgMjQuMDE4IDMxLjQ3NzggMjQuNzkwOUMzMS45NzgzIDI1LjU2MzcgMzEuNzU3NSAyNi41OTUxIDMwLjk4NDcgMjcuMDk1NUwyMy4wNDM0IDMyLjIzOUw5LjUxODczIDI3LjUzMUwyLjUzOTQxIDMxLjgxNzJDMS43NTQ5OSAzMi4yOTg5IDAuNzI4ODA5IDMyLjA1MzYgMC4yNDY4NTcgMzEuMjY5NUMtMC4yMzQ5MjMgMzAuNDg0OCAwLjAwOTk0MTI2IDI5LjQ1NzIgMC43OTQ1ODIgMjguOTc1NEw5LjEyMjczIDIzLjg2MjNMMjIuNTk3NCAyOC41NTM2WiIgZmlsbD0iI0YzRjNGNCIvPjwvc3ZnPgo%3D)](https://blog.tilderesearch.com/blog/parallax)
+[![License](https://img.shields.io/badge/-license-000000.svg)](LICENSE)
 
 This repository provides the official implementation of Parallax from the following paper:
 
-> **Parallax: Parameterized Local Linear Attention.**</br>
+> **Parallax: Parameterized Local Linear Attention for Language Modeling.**</br>
 > Yifei Zuo, Dhruv Pai, Zhichen Zeng, Alec Dewulf, Shuming Hu, and Zhaoran Wang.
 > arXiv preprint, 2026.
 
 Parallax is an upgrade to Softmax Attention. It is a scalable form of Local Linear Attention (LLA), a mechanism with provable theoretical advantages over Softmax Attention (see [FlashLLA](https://github.com/Yifei-Zuo/FlashLLA) for the LLA kernels). Parallax and LLA are **not** linear complexity attention mechanisms. They share the computational structure of Softmax Attention and require KV cache for decoding. Optimizations such as sliding window and block-sparsity are structurally compatible with Parallax.
 
-Try Parallax in Modded-NanoGPT: [https://github.com/Yifei-Zuo/modded-nanogpt-plx](https://github.com/Yifei-Zuo/modded-nanogpt-plx/tree/master/parallax)
+## Integrations
+
+[Modded-NanoGPT-plx](https://github.com/Yifei-Zuo/modded-nanogpt-plx/tree/master/parallax): Parallax for the Modded-NanoGPT speedrun.
+
+<p align="left">
+  <img src="assets/hyperball_zoom.png" width="40%" />
+  <img src="assets/pema_zoom.png" width="40%" />
+</p>
 
 ## Install
 
