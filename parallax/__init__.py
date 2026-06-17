@@ -2,19 +2,27 @@
 
 Public entry points:
   * ``parallax_func``       — Triton training (causal fwd+bwd, autograd).
+  * ``parallax_varlen_func`` — Triton variable-length (packed) training example.
   * ``parallax_fwd``, ``parallax_bwd`` — raw Triton kernels with the
                                           intermediate stats exposed.
   * ``parallax_reference``  — fp32 PyTorch reference, runs anywhere.
+  * ``parallax.triton.parallax_decode`` — pure-Triton single-token decode
+                                          (any CUDA GPU; no extra deps).
   * ``parallax_decode``     — SM90 CuTeDSL decode kernel  (extras: [decode]).
 
-The first three entry points work on any CUDA GPU and only require torch +
-triton. The cute-based decode kernel additionally needs
+All entry points except the cute decode kernel work on any CUDA GPU and only
+require torch + triton. The cute-based decode kernel additionally needs
 ``nvidia-cutlass-dsl`` and ``nvidia-cuda-python``; install the ``[decode]``
 extra to get it.
 """
 
 from parallax.reference import parallax_reference
-from parallax.triton import parallax_func, parallax_bwd, parallax_fwd
+from parallax.triton import (
+    parallax_func,
+    parallax_bwd,
+    parallax_fwd,
+    parallax_varlen_func,
+)
 
 # Optional extra: the cute decode kernel needs the [decode] stack. Substitute
 # a stub that raises on call so ``from parallax import parallax_decode`` still
@@ -38,6 +46,7 @@ except ImportError as _cute_err:
 
 __all__ = [
     "parallax_func",
+    "parallax_varlen_func",
     "parallax_fwd",
     "parallax_bwd",
     "parallax_reference",
