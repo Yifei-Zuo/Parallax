@@ -104,7 +104,7 @@ def parallax_decode(q: torch.Tensor,
                     qk_scale: float | None = None,
                     *,
                     window_size_left: int = -1,
-                    cache_start: torch.LongTensor | None = None) -> torch.Tensor:
+                    cache_start: torch.Tensor | None = None) -> torch.Tensor:
     """Single-token Parallax decode (``Sq == 1``), Triton. Forward-only.
 
     Args:

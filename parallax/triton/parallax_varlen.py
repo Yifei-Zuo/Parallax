@@ -741,7 +741,7 @@ def parallax_varlen_func(q: torch.Tensor,
                          v: torch.Tensor,
                          qk_scale: float | None = None,
                          window_size_left: int = -1,
-                         cu_seqlens: torch.LongTensor | None = None) -> torch.Tensor:
+                         cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
     """Variable-length (packed) causal Parallax training, with autograd.
 
     Uses the heads-last ``(B, T, HQ, D)`` layout (matching
@@ -757,8 +757,9 @@ def parallax_varlen_func(q: torch.Tensor,
         window_size_left: causal sliding-window length (FA2 convention). ``-1``
             (default) disables; ``>= 0`` restricts query ``i`` to keys
             ``[i - window_size_left + 1, i]``.
-        cu_seqlens: cumulative sequence lengths ``[N + 1]`` for packed varlen
-            inputs (batch size must be ``1``). ``None`` runs the dense path.
+        cu_seqlens: cumulative sequence lengths ``[N + 1]`` (int32 or int64) for
+            packed varlen inputs (batch size must be ``1``). ``None`` runs the
+            dense path.
 
     Returns:
         ``(B, T, HQ, D)`` tensor with the same dtype as ``q``.
@@ -771,11 +772,16 @@ def parallax_varlen_func(q: torch.Tensor,
         raise ValueError(
             f"H_q ({q.shape[2]}) must be divisible by H_kv ({k.shape[2]}) for GQA"
         )
-    if cu_seqlens is not None and q.shape[0] != 1:
-        raise ValueError(
-            f"The batch size must be 1 (got {q.shape[0]}) when using cu_seqlens. "
-            f"Flatten variable-length inputs into a single packed sequence first."
-        )
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError(
+                f"The batch size must be 1 (got {q.shape[0]}) when using cu_seqlens. "
+                f"Flatten variable-length inputs into a single packed sequence first."
+            )
+        if cu_seqlens.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                f"cu_seqlens must be int32 or int64, got {cu_seqlens.dtype}"
+            )
     if qk_scale is None:
         qk_scale = q.shape[-1] ** -0.5
     q, r, k, v = (t.contiguous() for t in (q, r, k, v))
