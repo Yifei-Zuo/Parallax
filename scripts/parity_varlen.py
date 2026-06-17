@@ -69,6 +69,8 @@ def _rel(out, ref):
 
 
 def _check_one(B, H_q, H_kv, L_max, D, W, nseq, seed):
+    if B != 1:
+        raise ValueError(f"parity_varlen packs varlen into one sequence; B must be 1, got B={B}")
     qk_scale = D ** -0.5
     lens = _seqlens(nseq, L_max, seed)
     q, r, k, v, cu = _make_packed(lens, H_q, H_kv, D, seed=seed)

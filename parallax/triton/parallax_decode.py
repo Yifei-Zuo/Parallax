@@ -125,6 +125,8 @@ def parallax_decode(q: torch.Tensor,
     if Sq != 1:
         raise ValueError(f"parallax_decode requires a single query (Sq=1), got Sq={Sq}.")
     Skv, H = k.shape[1], k.shape[2]
+    if HQ % H != 0:
+        raise ValueError(f"H_q ({HQ}) must be divisible by H_kv ({H}) for GQA")
     G = HQ // H
     if qk_scale is None:
         qk_scale = K ** -0.5

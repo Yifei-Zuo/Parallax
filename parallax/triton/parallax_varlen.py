@@ -767,6 +767,10 @@ def parallax_varlen_func(q: torch.Tensor,
         raise TypeError(
             f"parallax_varlen_func requires bf16 or fp16 inputs, got q.dtype={q.dtype}"
         )
+    if q.shape[2] % k.shape[2] != 0:
+        raise ValueError(
+            f"H_q ({q.shape[2]}) must be divisible by H_kv ({k.shape[2]}) for GQA"
+        )
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError(
             f"The batch size must be 1 (got {q.shape[0]}) when using cu_seqlens. "
