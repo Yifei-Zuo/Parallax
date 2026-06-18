@@ -16,7 +16,8 @@ Parallax is an upgrade to Softmax Attention. It is a scalable form of Local Line
 
 ## Integrations
 
-[Modded-NanoGPT-plx](https://github.com/Yifei-Zuo/modded-nanogpt-plx/tree/master/parallax): Parallax for the Modded-NanoGPT speedrun.
+- [Flash-Linear-Attention](https://github.com/fla-org/flash-linear-attention): Parallax kernels available in the `fla` library.
+- [Modded-NanoGPT-plx](https://github.com/Yifei-Zuo/modded-nanogpt-plx/tree/master/parallax): Parallax for the `Modded-NanoGPT` speedrun.
 
 <p align="left">
   <img src="assets/hyperball_zoom.png" width="40%" />
