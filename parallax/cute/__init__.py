@@ -7,6 +7,10 @@ the top-level :mod:`parallax` package catches that and substitutes a
 stub that raises a helpful error on call.
 """
 
-from parallax.cute.parallax_decode import parallax_decode
+from parallax.cute.parallax_decode import (
+    GraphedDecode,
+    parallax_attn_with_kvcache,
+    parallax_decode,
+)
 
-__all__ = ["parallax_decode"]
+__all__ = ["GraphedDecode", "parallax_attn_with_kvcache", "parallax_decode"]
