@@ -138,6 +138,30 @@ def test_seqused_k_shape_rejected():
         parallax_attn_with_kvcache(q, r, k, v, seqused_k=bad)
 
 
+def test_seqused_k_over_ceiling_rejected():
+    """seqused_k values exceeding k_cache.shape[1] must raise in eager mode."""
+    q, r, k, v = _qrkv(1, 8, 512)
+    over = torch.tensor([999], dtype=torch.int32, device="cuda")  # 999 > 512
+    with pytest.raises(ValueError, match="exceeds k_cache.shape"):
+        parallax_attn_with_kvcache(q, r, k, v, seqused_k=over)
+
+
+def test_seqused_k_zero_rejected():
+    """seqused_k=0 must raise in eager mode (kernel would clamp to 1)."""
+    q, r, k, v = _qrkv(1, 8, 512)
+    zero = torch.tensor([0], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="values < 1"):
+        parallax_attn_with_kvcache(q, r, k, v, seqused_k=zero)
+
+
+def test_seqused_k_negative_rejected():
+    """Negative seqused_k values must raise in eager mode."""
+    q, r, k, v = _qrkv(1, 8, 512)
+    neg = torch.tensor([-1], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="values < 1"):
+        parallax_attn_with_kvcache(q, r, k, v, seqused_k=neg)
+
+
 @pytest.mark.parametrize("ratio", [2, 4, 8])
 def test_gqa_supported(ratio):
     """GQA via head-packing lands at pack_n in {2, 4, 8}: one CTA emits

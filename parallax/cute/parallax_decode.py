@@ -152,12 +152,10 @@ class ParallaxDecodePersistentSplit:
         # 8..8+pack_n-1 (r_i=1) for S2_h, occupying the SAME lanes 4h..4h+3 of
         # warp 0 per head. pack_n is part of the compile-cache key.
         self.pack_n = pack_n
-        # num_stages=2 (default). The intra-CTA pipeline race that previously
-        # corrupted rows at large B*H regardless of num_stages was fixed by
-        # removing the deferred PV/V-release WGMMA overlap from the consumer
-        # tile loop (see docs/audit-num-stages.md and the loop below).
-        # PARALLAX_NUM_STAGES overrides the default; num_stages is part of the
-        # compile-cache key, so per-call overrides are safe.
+        # num_stages=2 (default). The pipeline race was fixed by removing
+        # the deferred PV/V-release WGMMA overlap (see the loop at ~line 1170).
+        # num_stages>2 is supported but untested. PARALLAX_NUM_STAGES
+        # overrides the default; num_stages is part of the compile-cache key.
         if num_stages is None:
             num_stages = int(os.environ.get("PARALLAX_NUM_STAGES", "2"))
         if num_stages < 2:
@@ -357,7 +355,17 @@ class ParallaxDecodePersistentSplit:
         # comparison anyway). The dispatcher rounds the launch kv_len up to a
         # bucket (typically pow2) so a serving session compiles a handful of
         # max_tiles_total variants, not one per kv_len.
-        kv_len = Int32(mSeqlenK[batch_idx])
+        #
+        # Clamp kv_len to [1, cache_len] to enforce the seqused_k contract
+        # under CUDA-graph replay. Out-of-range seqused_k silently produces
+        # garbage (> cache_len attends uninitialized KV) or NaN (kv_len=0
+        # yields -inf - -inf in the empty-split merger).  Use ternaries
+        # rather than cutlass.min/max — the lowered ops are not
+        # signed-clean for negative operands (see the SWA pattern above).
+        cache_len = max_tiles_total * 64
+        kv_len_raw = Int32(mSeqlenK[batch_idx])
+        kv_len_at_least_1 = kv_len_raw if kv_len_raw > Int32(1) else Int32(1)
+        kv_len = kv_len_at_least_1 if kv_len_at_least_1 < Int32(cache_len) else Int32(cache_len)
         # Use plain Python ints for n_block_size in the arithmetic; cutlass
         # promotes them. Avoid the explicit Int32(...) wrappers — they trigger
         # a "derefine" type-narrowing the cute pipeline can't legalize.
@@ -1151,7 +1159,8 @@ class ParallaxDecodePersistentSplit:
         # (PV_{t-1} overlapped with QK_t and a joint wait_group with deferred
         # V release) was a real, latent race at large B*H — corrupted ~1-4 /
         # 180 output rows on the launches that fill ≥1 SM wave, regardless of
-        # num_stages (root-cause + reproducer in docs/audit-num-stages.md).
+        # num_stages (root-cause: deferred V-release was removed; the serial
+        # WGMMA loop at ~line 1170 is now the only path). Bench delta vs the
         # Bench delta vs the deferred version on H200 is at the CUDA-event
         # noise floor (≤11 % at one B=1 point, 0 % elsewhere) — the WGMMA
         # scheduler already extracts QK/PV pipelining without the explicit
@@ -1165,7 +1174,7 @@ class ParallaxDecodePersistentSplit:
                 tSrQ,
                 tSrK[None, None, None, consumer_state.index],
                 zero_init=True,
-                wg_wait=0,
+                wg_wait=0,  # Must be >=0: warpgroup-collective wait before release
             )
             pipeline_k.consumer_release(consumer_state)
 
@@ -1203,7 +1212,7 @@ class ParallaxDecodePersistentSplit:
                 tOrP,
                 tOrVt[None, None, None, consumer_state.index],
                 zero_init=(t == k_start_tile),
-                wg_wait=0,
+                wg_wait=0,  # Must be >=0: warpgroup-collective wait before release
             )
             pipeline_v.consumer_release(consumer_state)
             consumer_state.advance()
@@ -1238,10 +1247,11 @@ class ParallaxDecodePersistentSplit:
                 q_head_base,
             )
         else:
-            # For pack_n>1 the split-K workspace would need a pack_n axis on the
-            # per-CTA scalar partials (m, d1, d2) and a per-(kv_head) counter;
-            # the dispatcher gates pack_n>1 to num_k_splits == 1 so this branch
-            # is only taken with pack_n=1, where q_head_base == head_idx.
+            # Split-K partials: each CTA writes (m, d1, d2, O) to per-head
+            # workspace slots. For pack_n>1 the CTA loops over pack_n heads
+            # (slots head_idx..head_idx+pack_n-1; q_head_base=kv_head*pack_n
+            # keeps them collision-free). The merger loops likewise.
+            # pack_n>1 + num_k_splits>1 IS supported.
             self._store_split_partials(
                 acc_O,
                 d2,
@@ -1781,7 +1791,7 @@ def parallax_decode_cutedsl_sm90(
     # Workspace plumbing: reshape (num_bh, S[, D]) → (B, H_q, S[, D]) so the
     # kernel can index with (batch_idx, q_head_base + h, k_split_id[, d]). The
     # counter is reshaped to (B, H_q) i32 (over-allocated by pack_n× for GQA;
-    # the kernel only writes the H_kv prefix).
+    # the kernel only writes the strided subset at slots kv_head*pack_n).
     B, H_q = q.shape[0], q.shape[2]
     ws_use = {
         "m":       ws["m"].view(B, H_q, num_k_splits),
@@ -1798,17 +1808,15 @@ def parallax_decode_cutedsl_sm90(
     ws_O2_t      = _cached_cute_tensor(ws_use["O2"])
     ws_counter_t = _cached_cute_tensor(ws_use["counter"])
 
-    # Per-batch seqlen tensor (B,) Int32. Per-batch indexing (vs a scalar
-    # (1,) tensor with [0] constexpr index) prevents cutlass-dsl 4.1 from
-    # const-folding the load to the trace value — same idiom flash-
-    # attention.cute's SeqlenInfo uses. When seqused_k is supplied, use it
-    # directly (and its address is stable across calls, supporting CUDA
-    # graphs); otherwise fill the cached buffer with the dense k.shape[1].
+    # Per-batch seqlen tensor (B,) Int32. Copy caller-provided seqused_k
+    # into the internal buffer to avoid unbounded _cute_input_cache leakage
+    # (each fresh tensor has a new data_ptr and pins its cute view forever).
     if seqused_k is not None:
-        seqlen_t = _cached_cute_tensor(seqused_k)
+        seqlen_buf = _get_seqlen_buf(B, q.device)
+        seqlen_buf.copy_(seqused_k)
     else:
         seqlen_buf = _get_seqlen_buf(B, q.device, kv_len)
-        seqlen_t = _cached_cute_tensor(seqlen_buf)
+    seqlen_t = _cached_cute_tensor(seqlen_buf)
 
     # The kernel reads per-batch kv_len at runtime from seqlen_t, so the
     # active length is NOT in the cache key. The K/V tensor shape IS in the
@@ -1846,7 +1854,7 @@ def parallax_decode_cutedsl_sm90(
 # address makes the buffer CUDA-graph-friendly (mirrors _WORKSPACE_CACHE).
 _SEQLEN_BUF_CACHE: dict[tuple, torch.Tensor] = {}
 
-def _get_seqlen_buf(B: int, device: torch.device, kv_len: int) -> torch.Tensor:
+def _get_seqlen_buf(B: int, device: torch.device, kv_len: int | None = None) -> torch.Tensor:
     device_index = device.index if device.index is not None else (
         torch.cuda.current_device() if device.type == "cuda" else -1
     )
@@ -1855,7 +1863,8 @@ def _get_seqlen_buf(B: int, device: torch.device, kv_len: int) -> torch.Tensor:
     if t is None:
         t = torch.empty(B, dtype=torch.int32, device=device)
         _SEQLEN_BUF_CACHE[key] = t
-    t.fill_(kv_len)
+    if kv_len is not None:
+        t.fill_(kv_len)
     return t
 
 
@@ -2122,9 +2131,10 @@ def parallax_attn_with_kvcache(
             "compile-once" across decode lengths: the kv_len-derived loop
             bounds are read at runtime per batch, so the compiled kernel is
             keyed on the bucket size, not the per-step length. Today
-            seqused_k must contain values ≤ ``k_cache.shape[1]``; ragged /
-            per-sequence padding (true varlen) lands with the paged-TMA
-            prefill/extend kernel.
+            seqused_k must contain values in [1, k_cache.shape[1]]; out-of-range
+            values are clamped in-kernel (the graph-safe enforcement path) and
+            raise ``ValueError`` in eager mode. Ragged / per-sequence padding
+            (true varlen) lands with the paged-TMA prefill/extend kernel.
         window_size: FA-style causal sliding window. ``None`` or ``(-1, -1)``
             disables; ``(left, right)`` with ``right <= 0`` restricts the query
             to the most recent ``left`` keys. A bare int is treated as ``left``.
@@ -2146,6 +2156,10 @@ def parallax_attn_with_kvcache(
           objects across calls. Provided inputs/outputs are memoized by data
           pointer and the internal split-K workspace is persistent and keyed by
           launch shape, so device addresses stay fixed across graph replays.
+          ``seqused_k`` values are copied into an internal ``(B,)`` int32 buffer
+          (one per ``(B, device)``), so callers may pass fresh tensors each step
+          without leaking cache entries. For graph capture, use
+          ``GraphedDecode.cache_seqlens`` directly.
           The workspace is **not** safe to share across concurrent calls of the
           same launch shape on different streams.
         * **Finite-padding contract.** The kernel reads KV in tiles of 64 and
@@ -2170,6 +2184,19 @@ def parallax_attn_with_kvcache(
             )
         if not seqused_k.is_cuda or seqused_k.device != q.device:
             raise ValueError("seqused_k must live on the same CUDA device as q")
+        # Eager-mode value-range check.  Skipped under graph capture
+        # (the in-kernel clamp is the graph-safe enforcement).
+        if not torch.cuda.is_current_stream_capturing():
+            max_val = seqused_k.max().item()
+            if max_val > k_cache.shape[1]:
+                raise ValueError(
+                    f"seqused_k max={max_val} exceeds k_cache.shape[1]={k_cache.shape[1]}; "
+                    f"values must be in [1, {k_cache.shape[1]}]"
+                )
+            if seqused_k.min().item() < 1:
+                raise ValueError(
+                    f"seqused_k has values < 1; values must be in [1, {k_cache.shape[1]}]"
+                )
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
     window_size_left = _window_size_to_left(window_size)
