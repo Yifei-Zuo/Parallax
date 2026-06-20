@@ -8,7 +8,9 @@ Public entry points:
   * ``parallax_reference``  — fp32 PyTorch reference, runs anywhere.
   * ``parallax.triton.parallax_decode`` — pure-Triton single-token decode
                                           (any CUDA GPU; no extra deps).
-  * ``parallax_decode``     — SM90 CuTeDSL decode kernel  (extras: [decode]).
+  * ``parallax_attn_with_kvcache`` — SM90 CuTeDSL decode against a KV cache,
+                                     canonical FA-style entry (extras: [decode]).
+  * ``parallax_decode``     — deprecated alias of the above (extras: [decode]).
 
 All entry points except the cute decode kernel work on any CUDA GPU and only
 require torch + triton. The cute-based decode kernel additionally needs
@@ -28,7 +30,11 @@ from parallax.triton import (
 # a stub that raises on call so ``from parallax import parallax_decode`` still
 # works on a training-only install.
 try:
-    from parallax.cute import parallax_decode
+    from parallax.cute import (
+        GraphedDecode,
+        parallax_attn_with_kvcache,
+        parallax_decode,
+    )
     decode_available: bool = True
 except ImportError as _cute_err:
     decode_available = False
@@ -40,8 +46,15 @@ except ImportError as _cute_err:
         f"Underlying import error: {_cute_err}"
     )
 
+    def parallax_attn_with_kvcache(*args, **kwargs):  # type: ignore[misc]
+        raise ImportError(_cute_err_msg)
+
     def parallax_decode(*args, **kwargs):  # type: ignore[misc]
         raise ImportError(_cute_err_msg)
+
+    class GraphedDecode:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            raise ImportError(_cute_err_msg)
 
 
 __all__ = [
@@ -50,6 +63,8 @@ __all__ = [
     "parallax_fwd",
     "parallax_bwd",
     "parallax_reference",
+    "parallax_attn_with_kvcache",
     "parallax_decode",
+    "GraphedDecode",
     "decode_available",
 ]
