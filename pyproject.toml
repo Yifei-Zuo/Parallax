@@ -36,9 +36,10 @@ dependencies = [
 
 [project.optional-dependencies]
 # Cute-based SM90 kernels (parallax_decode, parallax_prefill). Hopper only.
+# nvidia-cutlass-dsl 4.1.0 vendors its libs; do NOT add libs-base (it unpins
+# to 4.5.2 and overwrites the bundled libs with incompatible ones).
 decode = [
     "nvidia-cutlass-dsl==4.1.0",
-    "nvidia-cutlass-dsl-libs-base",
 ]
 # The bench harness compares the decode kernel against FA2 and runs the
 # parity tests, so it pulls the [decode] stack plus flash_attn + pytest.
@@ -48,7 +49,6 @@ bench = [
     "flash_attn>=2.8.3",
     "pytest>=7",
     "nvidia-cutlass-dsl==4.1.0",
-    "nvidia-cutlass-dsl-libs-base",
 ]
 # Minimal test stack: pytest + the [decode] kernels. The parity tests compare
 # against the in-repo fp32 reference (no flash_attn needed), so this is lighter
@@ -56,7 +56,6 @@ bench = [
 test = [
     "pytest>=7",
     "nvidia-cutlass-dsl==4.1.0",
-    "nvidia-cutlass-dsl-libs-base",
 ]
 
 [project.urls]
