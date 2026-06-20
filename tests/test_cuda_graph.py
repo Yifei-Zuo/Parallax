@@ -173,3 +173,60 @@ def test_graphed_decode_gqa(pack_n):
                                   scale_for(D), causal=True)
         assert not torch.isnan(out).any()
         assert rel_err(out, ref) < REL_TOL, f"GQA pack_n={pack_n} kv_len={kv_len}: rel_err too high"
+
+
+@pytest.mark.sm90
+def test_graphed_decode_non_pow2_clamp():
+    """Non-pow2 cache_len: in-kernel clamp uses real cache extent, not bucket.
+
+    k_cache.shape[1]=1500 (non-pow2), bucket=2048 (pow2). Under graph replay,
+    an out-of-range seqused_k > k.shape[1] must be clamped to 1500 by the
+    in-kernel clamp. The band (k.shape[1], bucket] no longer silently attends
+    uninitialized memory — the real-cache-extent clamp closes that hole.
+
+    We manually capture a graph (not via GraphedDecode) to inject an
+    out-of-range seqused_k into the stable seqlen buffer, bypassing the
+    host-side validation.
+    """
+    B, H, D = 1, 8, 128
+    cache_len = 1500  # non-pow2, bucket = 2048
+
+    q = torch.randn(B, 1, H, D, device="cuda", dtype=torch.bfloat16)
+    r = torch.randn_like(q) * 0.5
+    # K/V sized at the real cache extent (not bucket)
+    k = torch.randn(B, cache_len, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    out = torch.empty_like(q)
+    # Stable seqlen buffer (same idiom as the dispatcher)
+    seqlen_buf = torch.full((B,), cache_len, dtype=torch.int32, device="cuda")
+
+    # Warmup
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            parallax_attn_with_kvcache(q, r, k, v, seqused_k=seqlen_buf,
+                                       scale=scale_for(D), out=out)
+    torch.cuda.current_stream().wait_stream(s)
+
+    # Capture with valid seqused_k
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        parallax_attn_with_kvcache(q, r, k, v, seqused_k=seqlen_buf,
+                                   scale=scale_for(D), out=out)
+
+    # Inject out-of-range seqused_k into the stable buffer and replay
+    # 1800 > cache_len=1500, should clamp to 1500
+    seqlen_buf.fill_(1800)
+    g.replay()
+    torch.cuda.synchronize()
+    graph_out = out.clone()
+
+    # Reference: attend only up to cache_len (1500)
+    ref = parallax_reference(q, r, k, v, scale_for(D), causal=True)
+    assert not torch.isnan(graph_out).any() and not torch.isinf(graph_out).any()
+    assert rel_err(graph_out, ref) < REL_TOL, (
+        f"seqused_k=1800 on cache_len=1500 should clamp to 1500, "
+        f"but output differs from reference (rel_err={rel_err(graph_out, ref):.4f})"
+    )

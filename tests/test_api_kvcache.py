@@ -162,6 +162,23 @@ def test_seqused_k_negative_rejected():
         parallax_attn_with_kvcache(q, r, k, v, seqused_k=neg)
 
 
+def test_graphed_decode_cache_seqlens_range_validation():
+    """GraphedDecode.__call__ validates cache_seqlens in [1, max_kv_len]."""
+    from parallax import GraphedDecode
+    gd = GraphedDecode(B=1, H=8, max_kv_len=512, head_dim=128)
+    q, r, k, v = _qrkv(1, 8, 512)
+    gd.q.copy_(q); gd.r.copy_(r); gd.k.copy_(k); gd.v.copy_(v)
+    # Over-range
+    with pytest.raises(ValueError, match="out of range"):
+        gd(cache_seqlens=999)
+    # Zero
+    with pytest.raises(ValueError, match="out of range"):
+        gd(cache_seqlens=0)
+    # Negative
+    with pytest.raises(ValueError, match="out of range"):
+        gd(cache_seqlens=-1)
+
+
 @pytest.mark.parametrize("ratio", [2, 4, 8])
 def test_gqa_supported(ratio):
     """GQA via head-packing lands at pack_n in {2, 4, 8}: one CTA emits

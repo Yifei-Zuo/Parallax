@@ -11,9 +11,10 @@ Two tiers:
   minutes to JIT-compile. This is the shape-sparse race catcher; run it nightly
   / on demand.
 
-Everything is checked against the fp32 ``parallax_reference`` oracle; the
-not-yet-supported serving features (GQA, paged KV, varlen) are pinned as
-``xfail`` so CI flips green automatically when they land.
+Everything is checked against the fp32 ``parallax_reference`` oracle; GQA
+(head-packing ``pack_n ∈ {1, 2, 4, 8}``) is now supported. Not-yet-supported
+serving features (paged KV, varlen prefill/extend) raise ``NotImplementedError``
+and are covered in ``test_api_kvcache.py``.
 """
 from __future__ import annotations
 

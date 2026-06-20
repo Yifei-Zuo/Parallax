@@ -229,6 +229,7 @@ class ParallaxDecodePersistentSplit:
         num_k_splits: cutlass.Constexpr[int] = 1,
         window_size_left: cutlass.Constexpr[int] = -1,
         max_tiles_total: cutlass.Constexpr[int] = 0,
+        cache_len: cutlass.Constexpr[int] = 0,
     ):
         mK_tma, mV_tma = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0]))
@@ -297,6 +298,7 @@ class ParallaxDecodePersistentSplit:
             SharedStorage,
             num_k_splits,
             window_size_left,
+            cache_len,
         ).launch(
             # Grid head axis = H_kv (one CTA per KV head). For pack_n==1 this is
             # the same as H_q. For pack_n>1 (GQA), one CTA emits pack_n query-head
@@ -335,6 +337,7 @@ class ParallaxDecodePersistentSplit:
         SharedStorage: cutlass.Constexpr[Callable],
         num_k_splits: cutlass.Constexpr[int],
         window_size_left: cutlass.Constexpr[int],
+        cache_len: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         batch_idx, head_idx, k_split_id = cute.arch.block_idx()
@@ -357,12 +360,13 @@ class ParallaxDecodePersistentSplit:
         # max_tiles_total variants, not one per kv_len.
         #
         # Clamp kv_len to [1, cache_len] to enforce the seqused_k contract
-        # under CUDA-graph replay. Out-of-range seqused_k silently produces
-        # garbage (> cache_len attends uninitialized KV) or NaN (kv_len=0
-        # yields -inf - -inf in the empty-split merger).  Use ternaries
-        # rather than cutlass.min/max — the lowered ops are not
-        # signed-clean for negative operands (see the SWA pattern above).
-        cache_len = max_tiles_total * 64
+        # under CUDA-graph replay. cache_len is the true K/V extent
+        # (k.shape[1], a constexpr), not the pow2 bucket ceiling — so
+        # out-of-range seqused_k in (k.shape[1], bucket] is also clamped,
+        # preventing silent attention to zero-padded rows above the real
+        # cache. Use ternaries rather than cutlass.min/max — the lowered ops
+        # are not signed-clean for negative operands (see the SWA pattern
+        # above).
         kv_len_raw = Int32(mSeqlenK[batch_idx])
         kv_len_at_least_1 = kv_len_raw if kv_len_raw > Int32(1) else Int32(1)
         kv_len = kv_len_at_least_1 if kv_len_at_least_1 < Int32(cache_len) else Int32(cache_len)
@@ -1161,7 +1165,7 @@ class ParallaxDecodePersistentSplit:
         # 180 output rows on the launches that fill ≥1 SM wave, regardless of
         # num_stages (root-cause: deferred V-release was removed; the serial
         # WGMMA loop at ~line 1170 is now the only path). Bench delta vs the
-        # Bench delta vs the deferred version on H200 is at the CUDA-event
+        # deferred version on H200 is at the CUDA-event
         # noise floor (≤11 % at one B=1 point, 0 % elsewhere) — the WGMMA
         # scheduler already extracts QK/PV pipelining without the explicit
         # overlap, so correctness is free here.
@@ -1839,6 +1843,7 @@ def parallax_decode_cutedsl_sm90(
             num_k_splits,
             window_size_left,
             max_tiles_total,
+            k.shape[1],
         )
     _compile_cache[key](
         q_t, r_t, k_t, v_t, out_t,
@@ -2316,7 +2321,10 @@ class GraphedDecode:
         ``cache_seqlens`` is a ``(B,)`` int32 tensor (or Python int / list) of
         per-batch active KV lengths; ignored in static-length mode. Pass
         ``None`` to leave the previous value (e.g., when you mutate
-        ``self.cache_seqlens`` in place yourself).
+        ``self.cache_seqlens`` in place yourself). Values must be in
+        ``[1, max_kv_len]``; out-of-range values raise ``ValueError`` (the
+        in-kernel clamp is the graph-safe fallback, but host-side validation
+        catches contract violations early).
         """
         if q is not None:
             self.q.copy_(q)
@@ -2328,12 +2336,30 @@ class GraphedDecode:
             self.v.copy_(v)
         if cache_seqlens is not None and self.cache_seqlens is not None:
             if isinstance(cache_seqlens, int):
+                if cache_seqlens < 1 or cache_seqlens > self.max_kv_len:
+                    raise ValueError(
+                        f"cache_seqlens={cache_seqlens} out of range "
+                        f"[1, {self.max_kv_len}]"
+                    )
                 self.cache_seqlens.fill_(cache_seqlens)
             elif isinstance(cache_seqlens, (list, tuple)):
-                self.cache_seqlens.copy_(
-                    torch.tensor(cache_seqlens, dtype=torch.int32,
-                                 device=self.cache_seqlens.device))
+                t = torch.tensor(cache_seqlens, dtype=torch.int32,
+                                 device=self.cache_seqlens.device)
+                if min(cache_seqlens) < 1 or max(cache_seqlens) > self.max_kv_len:
+                    raise ValueError(
+                        f"cache_seqlens out of range [1, {self.max_kv_len}]: "
+                        f"got min={min(cache_seqlens)}, max={max(cache_seqlens)}"
+                    )
+                self.cache_seqlens.copy_(t)
             else:
+                # Tensor path: validate before copy (host-side, outside capture)
+                _min = cache_seqlens.min().item()
+                _max = cache_seqlens.max().item()
+                if _min < 1 or _max > self.max_kv_len:
+                    raise ValueError(
+                        f"cache_seqlens out of range [1, {self.max_kv_len}]: "
+                        f"got min={_min}, max={_max}"
+                    )
                 self.cache_seqlens.copy_(cache_seqlens)
         return self.replay()
 
