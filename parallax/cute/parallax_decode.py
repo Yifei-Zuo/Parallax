@@ -153,7 +153,7 @@ class ParallaxDecodePersistentSplit:
         # warp 0 per head. pack_n is part of the compile-cache key.
         self.pack_n = pack_n
         # num_stages=2 (default). The pipeline race was fixed by removing
-        # the deferred PV/V-release WGMMA overlap (see the loop at ~line 1170).
+        # the deferred PV/V-release WGMMA overlap (see the serial tile loop).
         # num_stages>2 is supported but untested. PARALLAX_NUM_STAGES
         # overrides the default; num_stages is part of the compile-cache key.
         if num_stages is None:
@@ -347,11 +347,9 @@ class ParallaxDecodePersistentSplit:
         # is the FA seqlen idiom (`SeqlenInfo.seqlen_k`): a per-batch index
         # prevents cutlass-dsl 4.1 from const-folding the load to the trace
         # value (a scalar (1,) tensor with index [0] folds; a (B,) tensor
-        # indexed by runtime batch_idx does not). Net: one compiled kernel
-        # serves every kv_len for the given (dtype, head_dim, B, H_kv,
-        # pack_n, num_k_splits, window_size_left, num_stages, max_tiles_total)
-        # tuple, killing the per-length recompile that dominated serving
-        # compile-time.
+        # indexed by runtime batch_idx does not), so one compiled kernel serves
+        # every runtime kv_len — the compile-cache key (see
+        # parallax_decode_cutedsl_sm90) is keyed on shapes, not active length.
         #
         # max_tiles_total is the constexpr upper bound on tiles_total used to
         # bound the inner loop (unroll=1 so the bound is a runtime
@@ -594,12 +592,6 @@ class ParallaxDecodePersistentSplit:
         # no-op when the runtime predicate (col >= valid_n / col < skip_n) is
         # always false, which is what happens on a clean-multiple kv_len or a
         # no-SWA / aligned-SWA call.
-        # Re-derive partial-last-tile + sliding-window constexprs that the
-        # tiles_total, valid_n_last_tile, first_valid_tile, first_tile_skip
-        # are now passed in as runtime Int32 from the outer kernel (derived
-        # from per-batch kv_len). The const_expr branches around the partial-
-        # tile and SWA-skip masks below are gone: the helpers run on every
-        # iteration and no-op when the runtime predicate is always false.
 
         wg_layout = cute.make_layout(1, stride=self.num_threads_per_warp_group)
         wg_mma_qk = tiled_mma_qk.get_slice(wg_layout(0))
@@ -1162,13 +1154,9 @@ class ParallaxDecodePersistentSplit:
         # the WGMMA that consumed them. The earlier deferred-release variant
         # (PV_{t-1} overlapped with QK_t and a joint wait_group with deferred
         # V release) was a real, latent race at large B*H — corrupted ~1-4 /
-        # 180 output rows on the launches that fill ≥1 SM wave, regardless of
-        # num_stages (root-cause: deferred V-release was removed; the serial
-        # WGMMA loop at ~line 1170 is now the only path). Bench delta vs the
-        # deferred version on H200 is at the CUDA-event
-        # noise floor (≤11 % at one B=1 point, 0 % elsewhere) — the WGMMA
-        # scheduler already extracts QK/PV pipelining without the explicit
-        # overlap, so correctness is free here.
+        # 180 output rows on launches that fill ≥1 SM wave, regardless of
+        # num_stages. The WGMMA scheduler still pipelines QK/PV without the
+        # explicit overlap, so the serial form has no measurable cost.
         for t in cutlass.range(k_start_tile, k_end_tile, unroll=1):
             acc_QR = cute.make_fragment(acc_S_shape, Float32)
             pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
@@ -1378,10 +1366,8 @@ class ParallaxDecodePersistentSplit:
         the runtime ``valid_n``; when ``valid_n == B_c`` the check is
         statically false everywhere and the compiler folds it away.
         """
-        # Mask S1 (r_i=0 rows 0..pack_n-1) for all live heads. Same row-only
-        # contract as before: S2 (r_i=1) is left as TMA delivered it (zeros for
-        # OOB K), which gives P_2 = P_1 * S_2 = 0 for masked columns; forcing
-        # S_2 to -inf would produce 0 * -inf = NaN inside the composite.
+        # Mask S1 (r_i=0 rows 0..pack_n-1) for all live heads; S2 untouched
+        # (see the docstring above for the row-only / 0*-inf=NaN contract).
         acc_mn = utils.make_acc_tensor_mn_view(acc_qr)
         thr_mma = tiled_mma_qk.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
         cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
@@ -1470,10 +1456,9 @@ class ParallaxDecodePersistentSplit:
         # cross-split exp() merge in `_merge_and_store_inkernel` uses the
         # same units as the per-split d1/d2 partials.
         _LN2 = Float32(0.6931471805599453)
-        # All partials writes go via `st.global.cg.f32` (cache-global) so
-        # the data bypasses L1 and lands in L2 — peer CTAs reading via
-        # `ld.global.cg` will see the latest write without depending on
-        # stale L1 lines being evicted.
+        # Partials writes use `st.global.cg.f32` (bypass L1 -> L2); the merger
+        # reads them with `ld.global.cv.f32` (cache-volatile) so it never sees
+        # a stale L1 line.
         # Unified pack_n layout: m_r/d1/d2 are per-lane scalars that the
         # softmax helper's width=4 warp_reduce broadcasts within each head's
         # 4 lanes (lanes 4h..4h+3 of warp 0 share head h's reduced state).
@@ -1640,10 +1625,9 @@ class ParallaxDecodePersistentSplit:
         #   c_norm    = d2_global / d1_global
         #   out[d]    = (1 + c_norm) * O1_d - O2_d
         _LOG2_E: cutlass.Constexpr[float] = 1.4426950408889634
-        # All partials reads go via `ld.global.cg.f32` (cache-global) so we
-        # bypass stale L1 cache lines and pick up the L2-resident writes
-        # published by peer CTAs through the acq_rel atomic + their
-        # `st.global.cg` stores.
+        # Partials reads use `ld.global.cv.f32` (cache-volatile) so we bypass
+        # stale L1 and pick up the L2-resident writes peer CTAs published
+        # through the acq_rel atomic + their `st.global.cg` stores.
         # Loop over the pack_n heads this CTA group merged. For pack_n=1 this
         # is one iteration at head_idx; for pack_n=8 it merges all eight
         # query heads associated with a single kv_head into mO.
@@ -1678,7 +1662,6 @@ class ParallaxDecodePersistentSplit:
                 O1_d = O1_acc * inv_d1
                 O2_d = O2_acc * inv_d1
                 o_fp32 = O1_d + c_norm * O1_d - O2_d
-                # Run the composite cancellation in fp32, cast at the store.
                 mO[batch_idx, 0, head_h, tidx] = mO.element_type(o_fp32)
 
 
@@ -2039,7 +2022,7 @@ def _decode_core(q: torch.Tensor,
     max_tiles_total = 1
     while max_tiles_total < tiles_exact:
         max_tiles_total <<= 1
-    bucket_kv_len = max_tiles_total * 64  # ceiling of the bucket
+    bucket_kv_len = max_tiles_total * 64
 
     # SWA reduces the effective tile range to [first_valid_tile, tiles_total).
     # Use the bucket ceiling for split-count picking so num_k_splits stays
@@ -2062,8 +2045,6 @@ def _decode_core(q: torch.Tensor,
     # original layout; for pack_n>1 each CTA writes pack_n head slots and the
     # merger loops pack_n times over the cross-split reduction.
     ws = _get_workspace(B * H, num_k_splits, D, q.device)
-    # The dispatcher allocates a fresh `out` when out is None (explicit
-    # ownership) and returns the tensor it actually wrote to.
     return parallax_decode_cutedsl_sm90(
         q, r, k, v, scale, ws=ws, num_k_splits=num_k_splits,
         window_size_left=window_size_left, pack_n=pack_n,
@@ -2372,7 +2353,7 @@ def parallax_decode(q: torch.Tensor,
                     *,
                     window_size_left: int = -1,
                     out: torch.Tensor | None = None) -> torch.Tensor:
-    """Deprecated alias for :func:`parallax_attn_with_kvcache`.
+    """Deprecated thin wrapper over the shared decode core.
 
     Kept for back-compat (existing benches/tests call it positionally). New
     code should prefer :func:`parallax_attn_with_kvcache`, which mirrors
