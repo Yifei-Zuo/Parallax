@@ -109,7 +109,7 @@ def _st_global_cg_f32(gmem_ptr: cute.Pointer, val: Float32) -> None:
 
 
 @cute.jit
-def _ld_global_cg_f32(gmem_ptr: cute.Pointer) -> Float32:
+def _ld_global_cv_f32(gmem_ptr: cute.Pointer) -> Float32:
     """`ld.global.cv.f32 dst, [ptr]` — cache-volatile load: never cached,
     always reads from L2 (or memory). Strongest hint to avoid stale
     cached values. We use .cv on the reader side (not .cg) to make
@@ -133,7 +133,7 @@ _cute_input_cache: dict[tuple, tuple] = {}
 
 
 class ParallaxDecodePersistentSplit:
-    def __init__(self, dtype, head_dim: int, *, n_block_size: int = 64, debug_stage: int = 0,
+    def __init__(self, dtype, head_dim: int, *, n_block_size: int = 64,
                  num_stages: int | None = None, pack_n: int = 1):
         if head_dim > 128:
             raise ValueError("SM90 TMA/WGMMA prototype requires head_dim <= 128")
@@ -163,7 +163,6 @@ class ParallaxDecodePersistentSplit:
         self.num_stages = num_stages
         self.num_threads = 256
         self.num_threads_per_warp_group = 128
-        self.debug_stage = debug_stage
 
     def _get_layouts(self):
         qk_atom = warpgroup.make_smem_layout_atom(
@@ -620,534 +619,6 @@ class ParallaxDecodePersistentSplit:
         d1 = Float32(0.0)
         d2 = Float32(0.0)
         consumer_state = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.num_stages)
-
-        if const_expr(self.debug_stage == 1):
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                pipeline_k.consumer_release(consumer_state)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(1.0)
-            return
-
-        if const_expr(self.debug_stage == 11):
-            if tidx == 0:
-                sP_row[0] = Float32(0.0)
-                sP_row[1] = Float32(0.0)
-            cute.arch.barrier(barrier_id=1, number_of_threads=self.num_threads_per_warp_group)
-            acc_QR = cute.make_fragment(acc_S_shape, Float32)
-            acc_mn = utils.make_acc_tensor_mn_view(acc_QR)
-            thr_mma = tiled_mma_qk.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
-            cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
-            cS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS))
-            for r_i in cutlass.range(cute.size(acc_mn, mode=[0]), unroll_full=True):
-                for c_i in cutlass.range(cute.size(acc_mn, mode=[1]), unroll_full=True):
-                    if cS_mn[r_i, c_i][0] == 0:
-                        sP_row[0] = Float32(1.0)
-                    if cS_mn[r_i, c_i][0] == 1:
-                        sP_row[1] = Float32(1.0)
-            cute.arch.barrier(barrier_id=1, number_of_threads=self.num_threads_per_warp_group)
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                pipeline_k.consumer_release(consumer_state)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = sP_row[0] + Float32(2.0) * sP_row[1]
-            return
-
-        if const_expr(self.debug_stage == 17):
-            acc_QR = cute.make_fragment(acc_S_shape, Float32)
-            acc_mn = utils.make_acc_tensor_mn_view(acc_QR)
-            thr_mma = tiled_mma_qk.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
-            cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
-            cS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS))
-            for r_i in cutlass.range(cute.size(acc_mn, mode=[0]), unroll_full=True):
-                for c_i in cutlass.range(cute.size(acc_mn, mode=[1]), unroll_full=True):
-                    if cS_mn[r_i, c_i][0] == 0 and cS_mn[r_i, c_i][1] < 64:
-                        mO[batch_idx, 0, head_idx, cS_mn[r_i, c_i][1]] = (r_i * 100 + c_i).to(Float32)
-                    if cS_mn[r_i, c_i][0] == 1 and cS_mn[r_i, c_i][1] < 64:
-                        mO[batch_idx, 0, head_idx, cS_mn[r_i, c_i][1] + 64] = (r_i * 100 + c_i).to(Float32)
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                pipeline_k.consumer_release(consumer_state)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            return
-
-        if const_expr(self.debug_stage == 2):
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(2.0)
-            return
-
-        if const_expr(self.debug_stage == 3):
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                m_r, d1, d2, alpha = self._row0_online_softmax_and_make_p(
-                    acc_QR,
-                    tiled_mma_qk,
-                    sP_row,
-                    sStats,
-                    m_r,
-                    d1,
-                    d2,
-                    softmax_scale_log2,
-                )
-                tOrP_acc = cute.make_tensor(acc_QR.iterator, utils.convert_layout_acc_frgA(acc_QR.layout))
-                utils.cvt_f16(tOrP_acc, tOrP)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(3.0)
-            return
-
-        if const_expr(self.debug_stage == 4):
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                m_r, d1, d2, alpha = self._row0_online_softmax_and_make_p(
-                    acc_QR,
-                    tiled_mma_qk,
-                    sP_row,
-                    sStats,
-                    m_r,
-                    d1,
-                    d2,
-                    softmax_scale_log2,
-                )
-                self._scale_output_rows01(acc_O, alpha, tiled_mma_pv)
-                tOrP_acc = cute.make_tensor(acc_QR.iterator, utils.convert_layout_acc_frgA(acc_QR.layout))
-                utils.cvt_f16(tOrP_acc, tOrP)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_pv,
-                    acc_O,
-                    tOrP,
-                    tOrVt[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=0,
-                )
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(4.0)
-            return
-
-        if const_expr(self.debug_stage == 5):
-            tOrP.fill(0.0)
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                pipeline_k.consumer_release(consumer_state)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_pv,
-                    acc_O,
-                    tOrP,
-                    tOrVt[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=0,
-                )
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(5.0)
-            return
-
-        if const_expr(self.debug_stage == 6):
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                tOrP.fill(0.0)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_pv,
-                    acc_O,
-                    tOrP,
-                    tOrVt[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=0,
-                )
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(6.0)
-            return
-
-        if const_expr(self.debug_stage == 7):
-            tOrP.fill(1.0)
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                pipeline_k.consumer_release(consumer_state)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_pv,
-                    acc_O,
-                    tOrP,
-                    tOrVt[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=0,
-                )
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(7.0)
-            return
-
-        if const_expr(self.debug_stage == 8):
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                m_r, d1, d2, alpha = self._row0_online_softmax_and_make_p(
-                    acc_QR,
-                    tiled_mma_qk,
-                    sP_row,
-                    sStats,
-                    m_r,
-                    d1,
-                    d2,
-                    softmax_scale_log2,
-                )
-                self._scale_output_rows01(acc_O, alpha, tiled_mma_pv)
-                tOrP_acc = cute.make_tensor(acc_QR.iterator, utils.convert_layout_acc_frgA(acc_QR.layout))
-                for i in cutlass.range_constexpr(cute.size(tOrP)):
-                    tOrP[i] = tOrP_acc[i].to(self.dtype)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_pv,
-                    acc_O,
-                    tOrP,
-                    tOrVt[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=0,
-                )
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(8.0)
-            return
-
-        if const_expr(self.debug_stage == 9):
-            acc_QR = cute.make_fragment(acc_S_shape, Float32)
-            acc_QR.fill(0.0)
-            acc_mn = utils.make_acc_tensor_mn_view(acc_QR)
-            thr_mma = tiled_mma_qk.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
-            cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
-            cS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS))
-            for r_i in cutlass.range(cute.size(acc_mn, mode=[0]), unroll_full=True):
-                for c_i in cutlass.range(cute.size(acc_mn, mode=[1]), unroll_full=True):
-                    if cS_mn[r_i, c_i][0] == 0:
-                        acc_mn[r_i, c_i] = 1.0
-            tOrP_acc = cute.make_tensor(acc_QR.iterator, utils.convert_layout_acc_frgA(acc_QR.layout))
-            for i in cutlass.range_constexpr(cute.size(tOrP)):
-                tOrP[i] = tOrP_acc[i].to(self.dtype)
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                pipeline_k.consumer_release(consumer_state)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_pv,
-                    acc_O,
-                    tOrP,
-                    tOrVt[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=0,
-                )
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(9.0)
-            return
-
-        if const_expr(self.debug_stage == 10):
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                acc_QR.fill(0.0)
-                acc_mn = utils.make_acc_tensor_mn_view(acc_QR)
-                thr_mma = tiled_mma_qk.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
-                cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
-                cS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS))
-                for r_i in cutlass.range(cute.size(acc_mn, mode=[0]), unroll_full=True):
-                    for c_i in cutlass.range(cute.size(acc_mn, mode=[1]), unroll_full=True):
-                        if cS_mn[r_i, c_i][0] == 0:
-                            acc_mn[r_i, c_i] = 1.0
-                tOrP_acc = cute.make_tensor(acc_QR.iterator, utils.convert_layout_acc_frgA(acc_QR.layout))
-                for i in cutlass.range_constexpr(cute.size(tOrP)):
-                    tOrP[i] = tOrP_acc[i].to(self.dtype)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_pv,
-                    acc_O,
-                    tOrP,
-                    tOrVt[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=0,
-                )
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = Float32(10.0)
-            return
-
-        if const_expr(self.debug_stage == 12):
-            for n_tile in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                m_r, d1, d2, alpha = self._row0_online_softmax_and_make_p(
-                    acc_QR,
-                    tiled_mma_qk,
-                    sP_row,
-                    sStats,
-                    m_r,
-                    d1,
-                    d2,
-                    softmax_scale_log2,
-                )
-                self._scale_output_rows01(acc_O, alpha, tiled_mma_pv)
-                tOrP_acc = cute.make_tensor(acc_QR.iterator, utils.convert_layout_acc_frgA(acc_QR.layout))
-                utils.cvt_f16(tOrP_acc, tOrP)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_pv,
-                    acc_O,
-                    tOrP,
-                    tOrVt[None, None, None, consumer_state.index],
-                    zero_init=n_tile == 0,
-                    wg_wait=0,
-                )
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = d2 * cute.arch.rcp_approx(d1)
-            return
-
-        if const_expr(self.debug_stage == 13):
-            rk_sum = Float32(0.0)
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                acc_mn = utils.make_acc_tensor_mn_view(acc_QR)
-                thr_mma = tiled_mma_qk.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
-                cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
-                cS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS))
-                for r_i in cutlass.range(cute.size(acc_mn, mode=[0]), unroll_full=True):
-                    for c_i in cutlass.range(cute.size(acc_mn, mode=[1]), unroll_full=True):
-                        if cS_mn[r_i, c_i][0] == 1:
-                            rk_sum += acc_mn[r_i, c_i]
-                rk_sum = utils.warp_reduce(rk_sum, operator.add, width=4)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = rk_sum / Float32(64.0)
-            return
-
-        if const_expr(self.debug_stage == 14):
-            all_sum = Float32(0.0)
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                acc_mn = utils.make_acc_tensor_mn_view(acc_QR)
-                for r_i in cutlass.range(cute.size(acc_mn, mode=[0]), unroll_full=True):
-                    for c_i in cutlass.range(cute.size(acc_mn, mode=[1]), unroll_full=True):
-                        all_sum += acc_mn[r_i, c_i]
-                all_sum = utils.warp_reduce(all_sum, operator.add, width=4)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = all_sum
-            return
-
-        if const_expr(self.debug_stage == 16):
-            for n_tile in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                acc_QR = cute.make_fragment(acc_S_shape, Float32)
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_qk,
-                    acc_QR,
-                    tSrQ,
-                    tSrK[None, None, None, consumer_state.index],
-                    zero_init=True,
-                    wg_wait=-1,
-                )
-                warpgroup.wait_group(0)
-                pipeline_k.consumer_release(consumer_state)
-                m_r, d1, d2, alpha = self._row0_online_softmax_and_make_p(
-                    acc_QR,
-                    tiled_mma_qk,
-                    sP_row,
-                    sStats,
-                    m_r,
-                    d1,
-                    d2,
-                    softmax_scale_log2,
-                )
-                self._scale_output_rows01(acc_O, alpha, tiled_mma_pv)
-                tOrP_acc = cute.make_tensor(acc_QR.iterator, utils.convert_layout_acc_frgA(acc_QR.layout))
-                utils.cvt_f16(tOrP_acc, tOrP)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                sm90_utils.gemm(
-                    tiled_mma_pv,
-                    acc_O,
-                    tOrP,
-                    tOrVt[None, None, None, consumer_state.index],
-                    zero_init=n_tile == 0,
-                    wg_wait=0,
-                )
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            acc_mn = utils.make_acc_tensor_mn_view(acc_O)
-            thr_mma = tiled_mma_pv.get_slice(cute.arch.thread_idx()[0] - self.num_threads_per_warp_group)
-            cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
-            cO_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cO))
-            row0_dim0 = Float32(0.0)
-            row1_dim0 = Float32(0.0)
-            all_sum = Float32(0.0)
-            for r_i in cutlass.range(cute.size(acc_mn, mode=[0]), unroll_full=True):
-                for c_i in cutlass.range(cute.size(acc_mn, mode=[1]), unroll_full=True):
-                    all_sum += acc_mn[r_i, c_i]
-                    if cO_mn[r_i, c_i][0] == 0 and cO_mn[r_i, c_i][1] == 0:
-                        row0_dim0 = acc_mn[r_i, c_i]
-                    if cO_mn[r_i, c_i][0] == 1 and cO_mn[r_i, c_i][1] == 0:
-                        row1_dim0 = acc_mn[r_i, c_i]
-            sStats[tidx] = all_sum
-            cute.arch.barrier(barrier_id=1, number_of_threads=self.num_threads_per_warp_group)
-            if tidx == 0:
-                total = Float32(0.0)
-                for i in cutlass.range(128, unroll=1):
-                    total += sStats[i]
-                mO[batch_idx, 0, head_idx, 0] = row0_dim0 * cute.arch.rcp_approx(d1)
-                mO[batch_idx, 0, head_idx, 1] = row1_dim0 * cute.arch.rcp_approx(d1)
-                mO[batch_idx, 0, head_idx, 2] = total * cute.arch.rcp_approx(d1)
-            return
-
-        if const_expr(self.debug_stage == 15):
-            q_sum = Float32(0.0)
-            r_sum = Float32(0.0)
-            lane = tidx % 32
-            d0 = lane
-            d1 = lane + 32
-            if d0 < self.head_dim:
-                q_sum += sQ[0, d0].to(Float32)
-                r_sum += sQ[1, d0].to(Float32)
-            if d1 < self.head_dim:
-                q_sum += sQ[0, d1].to(Float32)
-                r_sum += sQ[1, d1].to(Float32)
-            q_sum = utils.warp_reduce(q_sum, operator.add, width=32)
-            r_sum = utils.warp_reduce(r_sum, operator.add, width=32)
-            for _ in cutlass.range(k_start_tile, k_end_tile, unroll=1):
-                pipeline_k.consumer_wait(consumer_state, pipeline_k.consumer_try_wait(consumer_state))
-                pipeline_k.consumer_release(consumer_state)
-                pipeline_v.consumer_wait(consumer_state, pipeline_v.consumer_try_wait(consumer_state))
-                pipeline_v.consumer_release(consumer_state)
-                consumer_state.advance()
-            if tidx == 0:
-                mO[batch_idx, 0, head_idx, 0] = q_sum
-                mO[batch_idx, 0, head_idx, 1] = r_sum
-            return
 
         # Strictly serial WGMMA tile loop: each iteration retires both QK and
         # PV before the next tile begins, and releases K/V immediately after
@@ -1635,7 +1106,7 @@ class ParallaxDecodePersistentSplit:
             head_h = head_idx + h
             m_global = -Float32.inf
             for s in cutlass.range(num_k_splits, unroll_full=True):
-                m_s = _ld_global_cg_f32(utils.elem_pointer(mWs_m, (batch_idx, head_h, s)))
+                m_s = _ld_global_cv_f32(utils.elem_pointer(mWs_m, (batch_idx, head_h, s)))
                 m_global = m_s if m_s > m_global else m_global
 
             d1_global = Float32(0.0)
@@ -1643,17 +1114,17 @@ class ParallaxDecodePersistentSplit:
             O1_acc = Float32(0.0)
             O2_acc = Float32(0.0)
             for s in cutlass.range(num_k_splits, unroll_full=True):
-                m_s = _ld_global_cg_f32(utils.elem_pointer(mWs_m,  (batch_idx, head_h, s)))
-                d1_s = _ld_global_cg_f32(utils.elem_pointer(mWs_d1, (batch_idx, head_h, s)))
-                d2_s = _ld_global_cg_f32(utils.elem_pointer(mWs_d2, (batch_idx, head_h, s)))
+                m_s = _ld_global_cv_f32(utils.elem_pointer(mWs_m,  (batch_idx, head_h, s)))
+                d1_s = _ld_global_cv_f32(utils.elem_pointer(mWs_d1, (batch_idx, head_h, s)))
+                d2_s = _ld_global_cv_f32(utils.elem_pointer(mWs_d2, (batch_idx, head_h, s)))
                 # exp(m_s - m_global) = exp2((m_s - m_global) * log2(e)).
                 # m is stored in natural base (* ln2), see _store_split_partials.
                 w = utils.exp2f((m_s - m_global) * Float32(_LOG2_E))
                 d1_global += d1_s * w
                 d2_global += d2_s * w
                 if tidx < self.head_dim:
-                    O1_s = _ld_global_cg_f32(utils.elem_pointer(mWs_O1, (batch_idx, head_h, s, tidx)))
-                    O2_s = _ld_global_cg_f32(utils.elem_pointer(mWs_O2, (batch_idx, head_h, s, tidx)))
+                    O1_s = _ld_global_cv_f32(utils.elem_pointer(mWs_O1, (batch_idx, head_h, s, tidx)))
+                    O2_s = _ld_global_cv_f32(utils.elem_pointer(mWs_O2, (batch_idx, head_h, s, tidx)))
                     O1_acc += O1_s * w
                     O2_acc += O2_s * w
             inv_d1 = cute.arch.rcp_approx(d1_global)
@@ -1691,7 +1162,6 @@ def parallax_decode_cutedsl_sm90(
     v: torch.Tensor,
     qk_scale: float,
     *,
-    debug_stage: int = 0,
     ws: dict | None = None,
     num_k_splits: int = 1,
     window_size_left: int = -1,
@@ -1768,7 +1238,7 @@ def parallax_decode_cutedsl_sm90(
         out_t_cached = _cached_cute_tensor(out)
 
     dtype = cutlass.BFloat16 if q.dtype is torch.bfloat16 else cutlass.Float16
-    kernel = ParallaxDecodePersistentSplit(dtype, head_dim, debug_stage=debug_stage, pack_n=pack_n)
+    kernel = ParallaxDecodePersistentSplit(dtype, head_dim, pack_n=pack_n)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     scale_log2 = float(qk_scale) * math.log2(math.e)
 
@@ -1815,7 +1285,7 @@ def parallax_decode_cutedsl_sm90(
     # max_tiles_total is also in the key — it bounds the constexpr
     # tiles_per_split / merger unroll.
     key = (q.dtype, out.dtype, head_dim, q.shape[0], q.shape[2], k.shape[1],
-           debug_stage, num_k_splits, window_size_left, kernel.num_stages,
+           num_k_splits, window_size_left, kernel.num_stages,
            pack_n, max_tiles_total)
     if key not in _compile_cache:
         _compile_cache[key] = cute.compile(
