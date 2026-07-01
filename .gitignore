@@ -13,3 +13,4 @@ docs/
 *.csv
 .DS_Store
 uv.*
+dev/
