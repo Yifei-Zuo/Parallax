@@ -53,6 +53,14 @@ uv sync --extra bench
 pip install -e '.[bench]'
 ```
 
+Add the [Helion](https://github.com/pytorch/helion) kernels (experimental):
+
+```bash
+uv sync --extra helion
+# Or with pip:
+pip install -e '.[helion]'
+```
+
 ## Quickstart
 
 > Note: our current kernels are developed and tested on NVIDIA Hopper GPUs.
@@ -90,6 +98,27 @@ v = torch.randn_like(k)
 
 o = parallax_decode(q, r, k, v, qk_scale=1.0 / math.sqrt(D)) # (B, 1, H, D)
 ```
+
+### Helion kernels (experimental)
+
+[Helion](https://github.com/pytorch/helion) implementations of all three kernels
+— autotuned, compiled to Triton — live under `parallax.helion` with the same
+entry-point names and signatures:
+
+```python
+from parallax.helion import parallax_func, parallax_varlen_func, parallax_decode
+```
+
+On H100 (full autotune + CUDA-graph replay) vs the Triton kernels above:
+training step (fwd+bwd) **0.84×** geomean latency across a 17-shape grid,
+varlen **0.53×**, decode **1.8–6.4× faster**. Precision: q50 max-norm relative
+error < 1e-2 vs the fp32 reference for the output and all four gradients
+(`scripts/test_*_helion.py`).
+
+Helion autotunes on first call per shape — minutes per new shape with
+`HELION_AUTOTUNE_EFFORT=full` (cached via `HELION_CACHE_DIR`), immediate but
+slower with `=none`. For production, pin tuned configs — see
+[Helion's deployment docs](https://github.com/pytorch/helion/blob/main/docs/deployment_autotuning.md).
 
 ## Benchmark
 

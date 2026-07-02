@@ -76,6 +76,14 @@ from _test_utils import (  # noqa: E402
 from parallax import parallax_decode, parallax_reference  # noqa: E402
 from parallax.triton import parallax_decode as parallax_decode_triton  # noqa: E402
 
+# Optional: the Helion decode (evaluation track). Graceful absence -> column dropped.
+try:
+    from parallax.helion import parallax_decode as parallax_decode_helion  # noqa: E402
+    HAS_HELION = True
+except ImportError:
+    parallax_decode_helion = None
+    HAS_HELION = False
+
 
 # ── References ──────────────────────────────────────────────────────────
 def _ref_std_attn(q, k, v, scale):
@@ -253,6 +261,12 @@ def bench_one(batch, kv_len, nheads, head_dim, *, warmup, iters, trials,
             lambda: parallax_decode_triton(q, r, k, v, scale),
             ref_plx,
         )
+        if HAS_HELION:
+            errs["parallax-helion"] = _probe_err(
+                "parallax-helion",
+                lambda: parallax_decode_helion(q, r, k, v, scale),
+                ref_plx,
+            )
         del ref_std, ref_plx
     torch.cuda.synchronize()
 
@@ -279,6 +293,11 @@ def bench_one(batch, kv_len, nheads, head_dim, *, warmup, iters, trials,
     fn_plx_tri = lambda: parallax_decode_triton(q, r, k, v, scale)
     results["parallax-triton"] = _try_time("parallax-triton", fn_plx_tri,
                                            warmup, iters, trials, buf, error_log)
+
+    if HAS_HELION:
+        fn_plx_h = lambda: parallax_decode_helion(q, r, k, v, scale)
+        results["parallax-helion"] = _try_time("parallax-helion", fn_plx_h,
+                                               warmup, iters, trials, buf, error_log)
 
     return results, errs
 
@@ -331,11 +350,14 @@ def _make_table(backends, mode_str):
         "fa3-decode":      "FA3 (ms)",
         "parallax-cute":   "PLX (ms)",
         "parallax-triton": "PLX-T (ms)",
+        "parallax-helion": "PLX-H (ms)",
     }
     for b in backends:
         t.add_column(pretty[b], justify="right", no_wrap=True)
     t.add_column("PLX rel-err", justify="right", no_wrap=True)
     t.add_column("PLX-T rel-err", justify="right", no_wrap=True)
+    if "parallax-helion" in backends:
+        t.add_column("PLX-H rel-err", justify="right", no_wrap=True)
     return t
 
 
@@ -375,6 +397,8 @@ def main():
         backends.append("fa3-decode")
     backends.append("parallax-cute")
     backends.append("parallax-triton")
+    if HAS_HELION:
+        backends.append("parallax-helion")
 
     console = Console()
     cache_mode = "cold" if args.l2_flush else "warm"
@@ -425,6 +449,9 @@ def main():
                 row.append(cell)
             row.append(err_cell)
             row.append(err_cell_t)
+            if "parallax-helion" in backends:
+                plxh_err_q50 = errs.get("parallax-helion", (float("nan"),) * 8)[3]
+                row.append(f"[{_err_style(plxh_err_q50)}]{plxh_err_q50:.2e}[/]")
             table.add_row(*row)
 
             for backend in backends:
