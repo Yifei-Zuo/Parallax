@@ -109,24 +109,15 @@ entry-point names and signatures:
 from parallax.helion import parallax_func, parallax_varlen_func, parallax_decode
 ```
 
-Measured on H100 (full autotune + CUDA-graph replay) against the Triton kernels
-above (ratio < 1 means Helion is faster):
+On H100 (full autotune + CUDA-graph replay) vs the Triton kernels above:
+training step (fwd+bwd) **0.84×** geomean latency across a 17-shape grid,
+varlen **0.53×**, decode **1.8–6.4× faster**. Precision: q50 max-norm relative
+error < 1e-2 vs the fp32 reference for the output and all four gradients
+(`scripts/test_*_helion.py`).
 
-| Kernel | geomean latency vs Triton | Coverage |
-|---|---:|---|
-| Training step (fwd+bwd) | **0.84×** | 17-shape grid (B 1–8, L 1k–16k, D 64/128, MHA/GQA/MQA), faster on all 17 |
-| Varlen (packed) training | **0.53×** | uniform/variable lengths, GQA, D=64, SWA |
-| Decode | **1.8–6.4× faster** | also matches/beats the CuTeDSL kernel once `B*H` fills the GPU |
-
-Precision on all paths: q50 max-norm relative error < 1e-2 vs the fp32 reference
-for the output and all four gradients
-(`scripts/test_train_helion.py`, `test_varlen_helion.py`, `test_decode_helion.py`).
-
-Helion autotunes each kernel on first call per shape:
-`HELION_AUTOTUNE_EFFORT=full` reproduces the numbers above but takes minutes per
-new shape (results are cached across runs; set `HELION_CACHE_DIR` to persist),
-while `HELION_AUTOTUNE_EFFORT=none` runs immediately with default configs at
-reduced speed. For production, pin tuned configs — see
+Helion autotunes on first call per shape — minutes per new shape with
+`HELION_AUTOTUNE_EFFORT=full` (cached via `HELION_CACHE_DIR`), immediate but
+slower with `=none`. For production, pin tuned configs — see
 [Helion's deployment docs](https://github.com/pytorch/helion/blob/main/docs/deployment_autotuning.md).
 
 ## Benchmark
