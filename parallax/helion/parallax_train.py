@@ -449,9 +449,12 @@ class ParallaxFunction(torch.autograd.Function):
     def backward(ctx, grad_o):
         q, r, k, v, o, barv, d1, bart, m = ctx.saved_tensors
         grad_q, grad_r, grad_k, grad_v = parallax_bwd(
-            q, r, k, v, o, barv, d1, bart, m, grad_o,
+            q, r, k, v, o, barv, d1, bart, m, grad_o.contiguous(),
             ctx.qk_scale, ctx.window_size_left)
-        return grad_q, grad_r, grad_k, grad_v, None, None
+        # Kernels accumulate/store grads in bf16; cast back so autograd sees
+        # grads matching the input dtypes (fp16 inputs otherwise break).
+        return (grad_q.to(q.dtype), grad_r.to(r.dtype),
+                grad_k.to(k.dtype), grad_v.to(v.dtype), None, None)
 
 
 def parallax_func(q, r, k, v, qk_scale=None, window_size_left=-1):
@@ -460,6 +463,14 @@ def parallax_func(q, r, k, v, qk_scale=None, window_size_left=-1):
     Drop-in for :func:`parallax.parallax_func` (same shapes / default scale).
     ``qk_scale`` defaults to ``1 / sqrt(D)``.
     """
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(
+            f"parallax_func requires bf16 or fp16 inputs, got q.dtype={q.dtype}"
+        )
+    if q.shape[1] % k.shape[1] != 0:
+        raise ValueError(
+            f"H_q ({q.shape[1]}) must be divisible by H_kv ({k.shape[1]}) for GQA"
+        )
     D = q.shape[-1]
     if qk_scale is None:
         qk_scale = D ** -0.5

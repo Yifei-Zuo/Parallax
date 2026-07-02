@@ -58,9 +58,9 @@ test = [
     "nvidia-cutlass-dsl==4.1.0",
 ]
 # Helion DSL evaluation: the published Helion kernel-authoring DSL (compiles to
-# Triton). Needs only torch>=2.9 / triton>=3.5 (both satisfied by the pins above),
-# so it is a lighter extra than [decode]. Pulls rich/psutil so bench_decode's table
-# and the parity harness run without the heavy flash_attn build.
+# Triton; needs only the torch/triton pins above). Includes the [decode] stack so
+# benches can compare against the CuTe kernel, plus rich/psutil/pytest for the
+# bench tables and parity harnesses — i.e. [bench] minus the heavy flash_attn build.
 helion = [
     "helion",
     "rich>=13",

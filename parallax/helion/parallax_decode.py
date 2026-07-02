@@ -16,7 +16,8 @@ Two paths, chosen by the wrapper:
   * **split-KV** (flash-decoding) — grid ``B*H_q*num_splits``: each program reduces
     a KV slice to per-split ``(m,d1,d2,O1,O2)``, then a merge kernel LSE-combines
     the splits. Best for small ``B*H_q`` / long ``L`` (fills the GPU); ncu showed
-    the base kernel there lights only ``B*H_q`` of 132 SMs (DRAM ~1.7% of peak).
+    the base kernel there lights only ``B*H_q`` of the H100's 132 SMs (DRAM
+    ~1.7% of peak).
     Used only for the plain full-cache path (no window / no cache_start).
 """
 from __future__ import annotations
@@ -27,7 +28,17 @@ import helion
 import helion.language as hl
 
 _LOG2E = 1.4426950216  # 1 / ln(2); s1 is accumulated in base-2 units.
-_NUM_SMS = 132         # H100
+_SM_COUNT_CACHE: dict[int, int] = {}
+
+
+def _num_sms(device: torch.device) -> int:
+    """SM count of ``device`` (cached per device index)."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    n = _SM_COUNT_CACHE.get(idx)
+    if n is None:
+        n = torch.cuda.get_device_properties(idx).multi_processor_count
+        _SM_COUNT_CACHE[idx] = n
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -195,27 +206,27 @@ def _split_bounds(L: int, num_splits: int, device: torch.device) -> torch.Tensor
     return b
 
 
-def _choose_num_splits(B: int, Hq: int, L: int) -> int:
+def _choose_num_splits(B: int, Hq: int, L: int, num_sms: int) -> int:
     """Split only when the base grid (B*Hq CTAs) underfills the GPU; else 1.
 
     ``PLX_DECODE_SPLITS`` env overrides the count (experimental autoresearch knob):
     an int forces that many splits; ``waves<N>`` aims for N waves of CTAs.
     """
     bh = B * Hq
-    if bh >= _NUM_SMS or L < 1024:
+    if bh >= num_sms or L < 1024:
         return 1
     ov = os.environ.get("PLX_DECODE_SPLITS")
     if ov:
         if ov.startswith("waves"):
             waves = int(ov[5:] or "1")
-            ns = -(-(_NUM_SMS * waves) // bh)
+            ns = -(-(num_sms * waves) // bh)
         else:
             ns = int(ov)
         return max(1, min(ns, L // 128))
     # Aim for ~2 waves of CTAs: the extra concurrency hides HBM latency better
-    # than 1 wave (autoresearch iter 2: 2 waves matched/beat CuTe on 8-head
-    # long-context shapes; 3 waves regressed via merge overhead).
-    ns = -(-(_NUM_SMS * 2) // bh)     # ceil(2*SMs / bh)
+    # than 1 wave (2 waves matched/beat CuTe on 8-head long-context shapes;
+    # 3 waves regressed via merge overhead).
+    ns = -(-(num_sms * 2) // bh)     # ceil(2*SMs / bh)
     ns = min(ns, L // 128)           # keep >= ~128 keys/split
     return max(1, ns)
 
@@ -249,7 +260,7 @@ def parallax_decode(
 
     # Split-KV fast path: plain full cache (no window, no left-padding), small B*Hq.
     if window_size_left < 0 and cache_start is None:
-        ns = _choose_num_splits(B, Hq, Skv)
+        ns = _choose_num_splits(B, Hq, Skv, _num_sms(q.device))
         if ns > 1:
             bounds = _split_bounds(Skv, ns, q.device)
             pm, pd1, pd2, pO1, pO2 = _parallax_decode_partial(q, r, k, v, bounds, scale_log2)
