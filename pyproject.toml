@@ -57,15 +57,13 @@ test = [
     "pytest>=7",
     "nvidia-cutlass-dsl==4.1.0",
 ]
-# Helion kernels (compiles to Triton; uses the torch/triton pins above).
-# Equals [bench] minus the heavy flash_attn build, so the bench tables and
-# parity harnesses run against the CuTe kernel.
+# Helion kernels (compiles to Triton; uses the torch/triton pins above),
+# plus rich/psutil/pytest for the bench and parity harnesses.
 helion = [
     "helion==1.2.0",  # pinned: the kernels are tested against this release
     "rich>=13",
     "psutil",
     "pytest>=7",
-    "nvidia-cutlass-dsl==4.1.0",
 ]
 
 [project.urls]
