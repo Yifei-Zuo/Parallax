@@ -62,7 +62,9 @@ test = [
 # benches can compare against the CuTe kernel, plus rich/psutil/pytest for the
 # bench tables and parity harnesses — i.e. [bench] minus the heavy flash_attn build.
 helion = [
-    "helion",
+    # Pinned to the tested release: Helion moves fast and the kernels exercise
+    # version-sensitive tracer behavior (device-side loop bounds, acc= dot).
+    "helion==1.2.0",
     "rich>=13",
     "psutil",
     "pytest>=7",

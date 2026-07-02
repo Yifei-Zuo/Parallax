@@ -53,6 +53,14 @@ uv sync --extra bench
 pip install -e '.[bench]'
 ```
 
+Add the [Helion](https://github.com/pytorch/helion) kernels (experimental):
+
+```bash
+uv sync --extra helion
+# Or with pip:
+pip install -e '.[helion]'
+```
+
 ## Quickstart
 
 > Note: our current kernels are developed and tested on NVIDIA Hopper GPUs.
@@ -90,6 +98,36 @@ v = torch.randn_like(k)
 
 o = parallax_decode(q, r, k, v, qk_scale=1.0 / math.sqrt(D)) # (B, 1, H, D)
 ```
+
+### Helion kernels (experimental)
+
+[Helion](https://github.com/pytorch/helion) implementations of all three kernels
+— autotuned, compiled to Triton — live under `parallax.helion` with the same
+entry-point names and signatures:
+
+```python
+from parallax.helion import parallax_func, parallax_varlen_func, parallax_decode
+```
+
+Measured on H100 (full autotune + CUDA-graph replay) against the Triton kernels
+above (ratio < 1 means Helion is faster):
+
+| Kernel | geomean latency vs Triton | Coverage |
+|---|---:|---|
+| Training step (fwd+bwd) | **0.84×** | 17-shape grid (B 1–8, L 1k–16k, D 64/128, MHA/GQA/MQA), faster on all 17 |
+| Varlen (packed) training | **0.53×** | uniform/variable lengths, GQA, D=64, SWA |
+| Decode | **1.8–6.4× faster** | also matches/beats the CuTeDSL kernel once `B*H` fills the GPU |
+
+Precision on all paths: q50 max-norm relative error < 1e-2 vs the fp32 reference
+for the output and all four gradients
+(`scripts/test_train_helion.py`, `test_varlen_helion.py`, `test_decode_helion.py`).
+
+Helion autotunes each kernel on first call per shape:
+`HELION_AUTOTUNE_EFFORT=full` reproduces the numbers above but takes minutes per
+new shape (results are cached across runs; set `HELION_CACHE_DIR` to persist),
+while `HELION_AUTOTUNE_EFFORT=none` runs immediately with default configs at
+reduced speed. For production, pin tuned configs — see
+[Helion's deployment docs](https://github.com/pytorch/helion/blob/main/docs/deployment_autotuning.md).
 
 ## Benchmark
 
