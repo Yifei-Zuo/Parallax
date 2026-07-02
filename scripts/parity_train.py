@@ -181,12 +181,11 @@ def main():
                              num_warps=4, num_stages=2)]
         pre_cfg = [triton.Config({"ROW_TILE_SIZE": 64},
                                  num_warps=4, num_stages=2)]
-        fwd_mod = importlib.import_module("parallax.triton.parallax_fwd")
-        bwd_mod = importlib.import_module("parallax.triton.parallax_bwd")
-        fwd_mod._fwd_kernel.configs = cfg
-        bwd_mod._bwd_rq_kernel.configs = cfg
-        bwd_mod._bwd_kv_kernel.configs = cfg
-        bwd_mod._bwd_preprocess_kernel.configs = pre_cfg
+        train_mod = importlib.import_module("parallax.triton.parallax_train")
+        train_mod._fwd_kernel.configs = cfg
+        train_mod._bwd_rq_kernel.configs = cfg
+        train_mod._bwd_kv_kernel.configs = cfg
+        train_mod._bwd_preprocess_kernel.configs = pre_cfg
 
     cases = args.shape if args.shape else DEFAULT_CASES
     console = Console()
