@@ -15,9 +15,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytest.importorskip("helion")
-# Force default configs: first-call autotune would take minutes per kernel in CI.
+# Force default configs before any helion import (settings snapshot the env).
+# Deliberately unconditional: an inherited EFFORT=full would autotune for
+# minutes per kernel and read as a CI hang; the sweeps that do want tuned
+# configs live in scripts/test_*_helion.py.
 os.environ["HELION_AUTOTUNE_EFFORT"] = "none"
+pytest.importorskip("helion")
 
 from conftest import make_decode_inputs  # noqa: E402
 from parallax import parallax_reference  # noqa: E402

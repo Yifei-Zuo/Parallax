@@ -4,7 +4,7 @@ Exercises :func:`parallax.helion.parallax_func` end-to-end (autograd) and
 compares the output plus all four gradients against autograd through the fp32
 :func:`parallax.parallax_reference`. Gate = q50 max-norm relative error < 1e-2
 (the repo convention; the bf16 grad floor is ~3-6e-3). Covers MHA / GQA / MQA /
-SWA and head_dim 64/128 (which routes through the split forward).
+SWA and both forward routes: D=128 (masked single loop) and D=64 (causal split).
 
 Usage:
     python scripts/test_train_helion.py
