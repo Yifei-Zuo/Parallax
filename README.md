@@ -26,7 +26,10 @@ Parallax is an upgrade to Softmax Attention. It is a scalable form of Local Line
 
 ## Install
 
-Triton kernels (training, varlen, decode) and the fp32 reference:
+Triton and Helion each provide training (dense + varlen) and decode kernels;
+CuTeDSL provides the decode kernel only.
+
+Triton kernels and the fp32 reference:
 
 ```bash
 git clone https://github.com/Yifei-Zuo/Parallax.git
