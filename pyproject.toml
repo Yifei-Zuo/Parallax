@@ -24,22 +24,28 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Core deps are everything the Triton training path needs. The cute-based
-# SM90 decode / prefill kernels live behind the [decode] extra so a clone
-# of this repo aimed at training does not have to install the cutlass-dsl
-# stack (~200MB of nvidia-* wheels + a Hopper-only constraint).
+# Core deps cover the Triton training path and the Helion kernels. Kept
+# loose on purpose (floors = oldest tested stack): these paths use stable
+# torch/triton APIs and work on newer releases, e.g. inside a training env
+# that already ships its own torch. The version-sensitive path is the
+# cute-based SM90 decode / prefill stack, which lives behind the [decode]
+# extra with strict pins.
 dependencies = [
-    "torch==2.9.1",
-    "triton==3.5.1",
+    "torch>=2.9",
+    "triton>=3.5",
     "numpy",
 ]
 
 [project.optional-dependencies]
 # Cute-based SM90 kernels (parallax_decode, parallax_prefill). Hopper only.
-# nvidia-cutlass-dsl 4.1.0 vendors its libs; do NOT add libs-base (it unpins
-# to 4.5.2 and overwrites the bundled libs with incompatible ones).
+# This is the version-sensitive stack: nvidia-cutlass-dsl 4.1.0 requires
+# CUDA-12 cuda-python and is validated against exactly this torch/triton
+# pair. It also vendors its libs; do NOT add libs-base (it unpins to 4.5.2
+# and overwrites the bundled libs with incompatible ones).
 decode = [
     "nvidia-cutlass-dsl==4.1.0",
+    "torch==2.9.1",
+    "triton==3.5.1",
 ]
 # The bench harness compares the decode kernel against FA2 and runs the
 # parity tests, so it pulls the [decode] stack plus flash_attn + pytest.
@@ -49,6 +55,8 @@ bench = [
     "flash_attn>=2.8.3",
     "pytest>=7",
     "nvidia-cutlass-dsl==4.1.0",
+    "torch==2.9.1",
+    "triton==3.5.1",
 ]
 # Minimal test stack: pytest + the [decode] kernels. The parity tests compare
 # against the in-repo fp32 reference (no flash_attn needed), so this is lighter
@@ -56,11 +64,13 @@ bench = [
 test = [
     "pytest>=7",
     "nvidia-cutlass-dsl==4.1.0",
+    "torch==2.9.1",
+    "triton==3.5.1",
 ]
-# Helion kernels (compiles to Triton; uses the torch/triton pins above),
+# Helion kernels (compile to Triton; track the loose torch/triton deps above),
 # plus rich/psutil/pytest for the bench and parity harnesses.
 helion = [
-    "helion==1.2.0",  # pinned: the kernels are tested against this release
+    "helion>=1.2",  # tested against 1.2.0
     "rich>=13",
     "psutil",
     "pytest>=7",
