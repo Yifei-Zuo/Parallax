@@ -36,12 +36,12 @@ uv sync
 pip install -e .
 ```
 
-Add the SM90 decode kernels:
+Add the SM90 CuTeDSL decode kernels:
 
 ```bash
-uv sync --extra decode
+uv sync --extra cutedsl
 # Or with pip:
-pip install -e '.[decode]'
+pip install -e '.[cutedsl]'
 ```
 
 For the bench harness:

@@ -9,12 +9,12 @@ Public entry points:
   * ``parallax.triton.parallax_decode`` — pure-Triton single-token decode
                                           (any CUDA GPU; no extra deps).
   * ``parallax_attn_with_kvcache`` — SM90 CuTeDSL decode against a KV cache,
-                                     canonical FA-style entry (extras: [decode]).
-  * ``parallax_decode``     — deprecated alias of the above (extras: [decode]).
+                                     canonical FA-style entry (extras: [cutedsl]).
+  * ``parallax_decode``     — deprecated alias of the above (extras: [cutedsl]).
 
 All entry points except the cute decode kernel work on any CUDA GPU and only
 require torch + triton. The cute-based decode kernel additionally needs
-``nvidia-cutlass-dsl`` and ``nvidia-cuda-python``; install the ``[decode]``
+``nvidia-cutlass-dsl`` and ``nvidia-cuda-python``; install the ``[cutedsl]``
 extra to get it.
 """
 
@@ -26,7 +26,7 @@ from parallax.triton import (
     parallax_varlen_func,
 )
 
-# Optional extra: the cute decode kernel needs the [decode] stack. Substitute
+# Optional extra: the cute decode kernel needs the [cutedsl] stack. Substitute
 # a stub that raises on call so ``from parallax import parallax_decode`` still
 # works on a training-only install.
 try:
@@ -39,10 +39,10 @@ try:
 except ImportError as _cute_err:
     decode_available = False
     _cute_err_msg = (
-        "Parallax decode kernel requires the [decode] extra "
+        "Parallax decode kernel requires the [cutedsl] extra "
         "(nvidia-cutlass-dsl + nvidia-cuda-python, Hopper SM90 only). "
-        "Install with:  pip install 'parallax[decode]'  "
-        "or  uv sync --extra decode\n"
+        "Install with:  pip install 'parallax[cutedsl]'  "
+        "or  uv sync --extra cutedsl\n"
         f"Underlying import error: {_cute_err}"
     )
 

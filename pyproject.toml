@@ -28,7 +28,7 @@ classifiers = [
 # loose on purpose (floors = oldest tested stack): these paths use stable
 # torch/triton APIs and work on newer releases, e.g. inside a training env
 # that already ships its own torch. The version-sensitive path is the
-# cute-based SM90 decode / prefill stack, which lives behind the [decode]
+# cute-based SM90 decode / prefill stack, which lives behind the [cutedsl]
 # extra with strict pins.
 dependencies = [
     "torch>=2.9",
@@ -42,13 +42,13 @@ dependencies = [
 # CUDA-12 cuda-python and is validated against exactly this torch/triton
 # pair. It also vendors its libs; do NOT add libs-base (it unpins to 4.5.2
 # and overwrites the bundled libs with incompatible ones).
-decode = [
+cutedsl = [
     "nvidia-cutlass-dsl==4.1.0",
     "torch==2.9.1",
     "triton==3.5.1",
 ]
 # The bench harness compares the decode kernel against FA2 and runs the
-# parity tests, so it pulls the [decode] stack plus flash_attn + pytest.
+# parity tests, so it pulls the [cutedsl] stack plus flash_attn + pytest.
 bench = [
     "psutil",
     "rich>=13",
@@ -58,7 +58,7 @@ bench = [
     "torch==2.9.1",
     "triton==3.5.1",
 ]
-# Minimal test stack: pytest + the [decode] kernels. The parity tests compare
+# Minimal test stack: pytest + the [cutedsl] kernels. The parity tests compare
 # against the in-repo fp32 reference (no flash_attn needed), so this is lighter
 # than [bench] and is what CI installs.
 test = [
