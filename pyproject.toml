@@ -75,14 +75,6 @@ helion = [
     "psutil",
     "pytest>=7",
 ]
-# Helion kernels (compiles to Triton; uses the torch/triton pins above),
-# plus rich/psutil/pytest for the bench and parity harnesses.
-helion = [
-    "helion==1.2.0",  # pinned: the kernels are tested against this release
-    "rich>=13",
-    "psutil",
-    "pytest>=7",
-]
 
 [project.urls]
 Homepage = "https://github.com/Yifei-Zuo/Parallax"

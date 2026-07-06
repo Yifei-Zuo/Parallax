@@ -64,14 +64,6 @@ uv sync --extra bench
 pip install -e '.[bench]'
 ```
 
-Add the [Helion](https://github.com/pytorch/helion) kernels (experimental):
-
-```bash
-uv sync --extra helion
-# Or with pip:
-pip install -e '.[helion]'
-```
-
 ## Quickstart
 
 > Note: our current kernels are developed and tested on NVIDIA Hopper GPUs.
