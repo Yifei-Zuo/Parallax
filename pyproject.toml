@@ -3,11 +3,11 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "parallax"
+name = "parallax-kernel"
 version = "0.1.0"
-description = "Parallax kernel package."
+description = "Parallax: Parameterized Local Linear Attention kernels (Triton, Helion, CuTeDSL). Imports as `parallax`."
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [
     { name = "Yifei Zuo" },
@@ -47,33 +47,30 @@ cutedsl = [
     "torch==2.9.1",
     "triton==3.5.1",
 ]
-# The bench harness compares the decode kernel against FA2 and runs the
-# parity tests, so it pulls the [cutedsl] stack plus flash_attn + pytest.
+# Helion kernels (compile to Triton; track the loose torch/triton deps above).
+helion = [
+    "helion>=1.2",  # tested against 1.2.0
+]
+
+# Repo-only workflows — installed from a checkout (uv sync --group ...), never
+# published to PyPI. The strict pins reproduce the exact stack the kernels and
+# the recorded benchmark numbers were validated on.
+[dependency-groups]
+# Parity tests: pytest + the [cutedsl] kernels + the Helion kernels. The tests
+# compare against the in-repo fp32 reference (no flash_attn needed).
+test = [
+    "pytest>=7",
+    "helion>=1.2",
+    "nvidia-cutlass-dsl==4.1.0",
+    "torch==2.9.1",
+    "triton==3.5.1",
+]
+# The bench harness additionally compares the decode kernel against FA2.
 bench = [
+    { include-group = "test" },
     "psutil",
     "rich>=13",
     "flash_attn>=2.8.3",
-    "pytest>=7",
-    "nvidia-cutlass-dsl==4.1.0",
-    "torch==2.9.1",
-    "triton==3.5.1",
-]
-# Minimal test stack: pytest + the [cutedsl] kernels. The parity tests compare
-# against the in-repo fp32 reference (no flash_attn needed), so this is lighter
-# than [bench] and is what CI installs.
-test = [
-    "pytest>=7",
-    "nvidia-cutlass-dsl==4.1.0",
-    "torch==2.9.1",
-    "triton==3.5.1",
-]
-# Helion kernels (compile to Triton; track the loose torch/triton deps above),
-# plus rich/psutil/pytest for the bench and parity harnesses.
-helion = [
-    "helion>=1.2",  # tested against 1.2.0
-    "rich>=13",
-    "psutil",
-    "pytest>=7",
 ]
 
 [project.urls]
