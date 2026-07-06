@@ -26,23 +26,34 @@ Parallax is an upgrade to Softmax Attention. It is a scalable form of Local Line
 
 ## Install
 
+Triton and Helion each provide training (dense + varlen) and decode kernels.</br>
+CuTeDSL provides the decode kernel only.
+
+Triton kernels and the fp32 reference:
+
 ```bash
 git clone https://github.com/Yifei-Zuo/Parallax.git
 cd Parallax
 
-# Training only (Triton + reference)
 uv sync
 # Or with pip:
-pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
 pip install -e .
 ```
 
-Add the SM90 decode kernels:
+Add the [Helion](https://github.com/pytorch/helion) kernels (experimental):
 
 ```bash
-uv sync --extra decode
+uv sync --extra helion
 # Or with pip:
-pip install -e '.[decode]'
+pip install -e '.[helion]'
+```
+
+Add the SM90 CuTeDSL decode kernels:
+
+```bash
+uv sync --extra cutedsl
+# Or with pip:
+pip install -e '.[cutedsl]'
 ```
 
 For the bench harness:
