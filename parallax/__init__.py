@@ -33,12 +33,10 @@ from parallax.triton import (
     parallax_varlen_func,
 )
 
-# Optional extra: the cute decode kernel needs the [cutedsl] stack. Substitute
-# a stub that raises on call so ``from parallax import parallax_decode`` still
-# works on a training-only install. Catch Exception, not just ImportError: a
-# present-but-broken cute stack (no NVIDIA driver, non-SM90 machine,
-# torch/cutlass ABI mismatch) can raise RuntimeError, OSError, etc. at import
-# time, and none of those should take down the Triton/Helion paths.
+# Optional [cutedsl] stack: substitute stubs that raise on call so these names
+# still import on a training-only install. Catch Exception, not ImportError —
+# a present-but-broken stack (no NVIDIA driver, non-SM90 GPU) raises
+# RuntimeError/OSError at import and must not take down the Triton/Helion paths.
 try:
     from parallax.cute import (
         GraphedDecode,
@@ -68,11 +66,7 @@ except Exception as _cute_err:
 
 
 def __getattr__(name):
-    # Deprecated alias, kept for 0.1.0 compatibility. The old name suggested
-    # no decode kernel exists at all, but the Triton (and, with [helion],
-    # Helion) decode kernels are always importable — only the CuTeDSL kernel
-    # is optional.
-    if name == "decode_available":
+    if name == "decode_available":  # deprecated 0.1.0 alias
         import warnings
 
         warnings.warn(
