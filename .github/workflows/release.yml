@@ -35,7 +35,7 @@ jobs:
 
   # Install the built wheel on a clean GPU-less runner and import it.
   # CPU torch keeps the download small; the cute extra is absent, so this
-  # also exercises the decode_available=False fallback path.
+  # also exercises the cute_decode_available=False fallback path.
   smoke:
     needs: build
     runs-on: ubuntu-latest
@@ -54,7 +54,8 @@ jobs:
           import parallax
           assert parallax.__version__ != '0.0.0+unknown'
           print('version:', parallax.__version__)
-          print('decode_available:', parallax.decode_available)
+          assert parallax.cute_decode_available is False
+          print('cute_decode_available:', parallax.cute_decode_available)
           from parallax import parallax_func, parallax_varlen_func, parallax_reference
           print('imports OK')
           "

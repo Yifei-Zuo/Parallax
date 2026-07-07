@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallax-kernel"
-version = "0.1.0"
+version = "0.1.1"
 description = "Parallax: Parameterized Local Linear Attention kernels (Triton, Helion, CuTeDSL). Imports as `parallax`."
 readme = "README.md"
 requires-python = ">=3.12"

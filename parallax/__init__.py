@@ -35,16 +35,19 @@ from parallax.triton import (
 
 # Optional extra: the cute decode kernel needs the [cutedsl] stack. Substitute
 # a stub that raises on call so ``from parallax import parallax_decode`` still
-# works on a training-only install.
+# works on a training-only install. Catch Exception, not just ImportError: a
+# present-but-broken cute stack (no NVIDIA driver, non-SM90 machine,
+# torch/cutlass ABI mismatch) can raise RuntimeError, OSError, etc. at import
+# time, and none of those should take down the Triton/Helion paths.
 try:
     from parallax.cute import (
         GraphedDecode,
         parallax_attn_with_kvcache,
         parallax_decode,
     )
-    decode_available: bool = True
-except ImportError as _cute_err:
-    decode_available = False
+    cute_decode_available: bool = True
+except Exception as _cute_err:
+    cute_decode_available = False
     _cute_err_msg = (
         "Parallax decode kernel requires the [cutedsl] extra "
         "(nvidia-cutlass-dsl + cuda-python, Hopper SM90 only). "
@@ -64,6 +67,26 @@ except ImportError as _cute_err:
             raise ImportError(_cute_err_msg)
 
 
+def __getattr__(name):
+    # Deprecated alias, kept for 0.1.0 compatibility. The old name suggested
+    # no decode kernel exists at all, but the Triton (and, with [helion],
+    # Helion) decode kernels are always importable — only the CuTeDSL kernel
+    # is optional.
+    if name == "decode_available":
+        import warnings
+
+        warnings.warn(
+            "parallax.decode_available is deprecated; use "
+            "parallax.cute_decode_available. It only reports the optional "
+            "CuTeDSL SM90 kernel — the Triton and Helion decode kernels do "
+            "not depend on it.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return cute_decode_available
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "__version__",
     "parallax_func",
@@ -74,5 +97,5 @@ __all__ = [
     "parallax_attn_with_kvcache",
     "parallax_decode",
     "GraphedDecode",
-    "decode_available",
+    "cute_decode_available",
 ]

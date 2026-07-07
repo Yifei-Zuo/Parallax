@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-07
+
+### Changed
+
+- Renamed `parallax.decode_available` to `parallax.cute_decode_available`:
+  the flag only reports the optional CuTeDSL SM90 kernel — the Triton (and,
+  with the `[helion]` extra, Helion) decode kernels are always importable.
+  `decode_available` remains as a deprecated alias and emits a
+  `DeprecationWarning`.
+
+### Fixed
+
+- `import parallax` no longer crashes when the cutedsl stack is installed
+  but fails to load (missing NVIDIA driver, non-SM90 GPU, torch/cutlass ABI
+  mismatch, ...). The optional import now tolerates any exception — not just
+  `ImportError` — and the CuTeDSL entry points raise a helpful `ImportError`
+  on call instead.
+
 ## [0.1.0] - 2026-07-07
 
 First PyPI release, published as `parallax-kernel` (imports as `parallax`).
@@ -30,4 +48,5 @@ First PyPI release, published as `parallax-kernel` (imports as `parallax`).
 - Bench harness (`scripts/bench_decode.py`) with FA2/FA3 speed + precision
   comparison, and a parity test suite against the fp32 reference.
 
+[0.1.1]: https://github.com/Yifei-Zuo/Parallax/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Yifei-Zuo/Parallax/releases/tag/v0.1.0
