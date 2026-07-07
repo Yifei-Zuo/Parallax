@@ -44,6 +44,7 @@ dependencies = [
 # and overwrites the bundled libs with incompatible ones).
 cutedsl = [
     "nvidia-cutlass-dsl==4.1.0",
+    "cuda-python>=12.8,<13",  # direct import (cuda.bindings); mirrors the cutlass-dsl constraint
     "torch==2.9.1",
     "triton==3.5.1",
 ]
@@ -62,6 +63,7 @@ test = [
     "pytest>=7",
     "helion>=1.2",
     "nvidia-cutlass-dsl==4.1.0",
+    "cuda-python>=12.8,<13",
     "torch==2.9.1",
     "triton==3.5.1",
 ]
