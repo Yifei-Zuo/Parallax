@@ -14,9 +14,16 @@ Public entry points:
 
 All entry points except the cute decode kernel work on any CUDA GPU and only
 require torch + triton. The cute-based decode kernel additionally needs
-``nvidia-cutlass-dsl`` and ``nvidia-cuda-python``; install the ``[cutedsl]``
+``nvidia-cutlass-dsl`` and ``cuda-python``; install the ``[cutedsl]``
 extra to get it.
 """
+
+from importlib.metadata import PackageNotFoundError, version as _dist_version
+
+try:
+    __version__ = _dist_version("parallax-kernel")
+except PackageNotFoundError:  # source tree without installed dist metadata
+    __version__ = "0.0.0+unknown"
 
 from parallax.reference import parallax_reference
 from parallax.triton import (
@@ -40,8 +47,8 @@ except ImportError as _cute_err:
     decode_available = False
     _cute_err_msg = (
         "Parallax decode kernel requires the [cutedsl] extra "
-        "(nvidia-cutlass-dsl + nvidia-cuda-python, Hopper SM90 only). "
-        "Install with:  pip install 'parallax[cutedsl]'  "
+        "(nvidia-cutlass-dsl + cuda-python, Hopper SM90 only). "
+        "Install with:  pip install 'parallax-kernel[cutedsl]'  "
         "or  uv sync --extra cutedsl\n"
         f"Underlying import error: {_cute_err}"
     )
@@ -58,6 +65,7 @@ except ImportError as _cute_err:
 
 
 __all__ = [
+    "__version__",
     "parallax_func",
     "parallax_varlen_func",
     "parallax_fwd",

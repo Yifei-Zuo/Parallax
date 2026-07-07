@@ -4,7 +4,7 @@
 [![HF Papers](https://img.shields.io/badge/-Huggingface-000000.svg?logo=huggingface&logoColor=FFD21E)](https://huggingface.co/papers/2605.29157)
 [![X](https://img.shields.io/badge/-Post-000000.svg?logo=x&logoColor=white)](https://x.com/YifeiZuoX/status/2060499152791077082)
 [![Blog](https://img.shields.io/badge/-Blog-000000.svg?logo=data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSItMSAtMSAzNCAzNSIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBkPSJNMjIuNTk3NCAxNi42MjJMMjkuMTczMSAxMi4zNjYxQzI5Ljk0NTkgMTEuODY1NyAzMC45NzczIDEyLjA4NjQgMzEuNDc3OCAxMi44NTkyQzMxLjk3ODMgMTMuNjMyMSAzMS43NTc1IDE0LjY2MzQgMzAuOTg0NyAxNS4xNjM5TDIzLjA0MzQgMjAuMzA3NEw5LjUxODczIDE1LjU5OTRMMi41Mzk0MSAxOS44ODU2QzEuNzU0OTkgMjAuMzY3MiAwLjcyODgwOSAyMC4xMjIgMC4yNDY4NTcgMTkuMzM3OEMtMC4yMzQ5MjMgMTguNTUzMiAwLjAwOTk0MTI2IDE3LjUyNTYgMC43OTQ1ODIgMTcuMDQzOEw5LjEyMjczIDExLjkzMDdMMjIuNTk3NCAxNi42MjJaIiBmaWxsPSIjRjNGM0Y0Ii8%2BPHBhdGggZD0iTTIyLjU5NzQgNC42OTEzMkwyOS4xNzMxIDAuNDM1NDQ5QzI5Ljk0NTkgLTAuMDY1MDA5NSAzMC45NzczIDAuMTU1NzQxIDMxLjQ3NzggMC45Mjg1NTNDMzEuOTc4MyAxLjcwMTQxIDMxLjc1NzUgMi43MzI3OCAzMC45ODQ3IDMuMjMzMjVMMjMuMDQzNCA4LjM3NjdMOS41MTg3MyAzLjY2ODY5TDIuNTM5NDEgNy45NTQ5MUMxLjc1NDk5IDguNDM2NTUgMC43Mjg4MDkgOC4xOTEyOSAwLjI0Njg1NyA3LjQwNzE4Qy0wLjIzNDkyMyA2LjYyMjU0IDAuMDA5OTQxMjYgNS41OTQ4OSAwLjc5NDU4MiA1LjExMzExTDkuMTIyNzMgMEwyMi41OTc0IDQuNjkxMzJaIiBmaWxsPSIjRjNGM0Y0Ii8%2BPHBhdGggZD0iTTIyLjU5NzQgMjguNTUzNkwyOS4xNzMxIDI0LjI5NzhDMjkuOTQ1OSAyMy43OTczIDMwLjk3NzMgMjQuMDE4IDMxLjQ3NzggMjQuNzkwOUMzMS45NzgzIDI1LjU2MzcgMzEuNzU3NSAyNi41OTUxIDMwLjk4NDcgMjcuMDk1NUwyMy4wNDM0IDMyLjIzOUw5LjUxODczIDI3LjUzMUwyLjUzOTQxIDMxLjgxNzJDMS43NTQ5OSAzMi4yOTg5IDAuNzI4ODA5IDMyLjA1MzYgMC4yNDY4NTcgMzEuMjY5NUMtMC4yMzQ5MjMgMzAuNDg0OCAwLjAwOTk0MTI2IDI5LjQ1NzIgMC43OTQ1ODIgMjguOTc1NEw5LjEyMjczIDIzLjg2MjNMMjIuNTk3NCAyOC41NTM2WiIgZmlsbD0iI0YzRjNGNCIvPjwvc3ZnPgo%3D)](https://blog.tilderesearch.com/blog/parallax)
-[![License](https://img.shields.io/badge/-license-000000.svg)](LICENSE)
+[![License](https://img.shields.io/badge/-license-000000.svg)](https://github.com/Yifei-Zuo/Parallax/blob/main/LICENSE)
 
 This repository provides the official implementation of Parallax from the following paper:
 
@@ -20,8 +20,8 @@ Parallax is an upgrade to Softmax Attention. It is a scalable form of Local Line
 - [Modded-NanoGPT-plx](https://github.com/Yifei-Zuo/modded-nanogpt-plx/tree/master/parallax): Parallax for the `Modded-NanoGPT` speedrun.
 
 <p align="left">
-  <img src="assets/hyperball_zoom.png" width="40%" />
-  <img src="assets/pema_zoom.png" width="40%" />
+  <img src="https://raw.githubusercontent.com/Yifei-Zuo/Parallax/main/assets/hyperball_zoom.png" width="40%" />
+  <img src="https://raw.githubusercontent.com/Yifei-Zuo/Parallax/main/assets/pema_zoom.png" width="40%" />
 </p>
 
 ## Install
@@ -32,36 +32,29 @@ CuTeDSL provides the decode kernel only.
 Triton kernels and the fp32 reference:
 
 ```bash
-git clone https://github.com/Yifei-Zuo/Parallax.git
-cd Parallax
-
-uv sync
-# Or with pip:
-pip install -e .
+pip install parallax-kernel
 ```
 
 Add the [Helion](https://github.com/pytorch/helion) kernels (experimental):
 
 ```bash
-uv sync --extra helion
-# Or with pip:
-pip install -e '.[helion]'
+pip install 'parallax-kernel[helion]'
 ```
 
-Add the SM90 CuTeDSL decode kernels:
+Add the SM90 CuTeDSL decode kernels (pins torch 2.9.1 / triton 3.5.1):
 
 ```bash
-uv sync --extra cutedsl
-# Or with pip:
-pip install -e '.[cutedsl]'
+pip install 'parallax-kernel[cutedsl]'
 ```
 
-For the bench harness:
+For development or the bench and parity harnesses, install from source:
 
 ```bash
-uv sync --extra bench
-# Or with pip:
-pip install -e '.[bench]'
+git clone https://github.com/Yifei-Zuo/Parallax.git
+cd Parallax
+
+uv sync                # core; add --extra helion / --extra cutedsl as needed
+uv sync --group bench  # bench harness: pinned stack + FA2 + pytest
 ```
 
 ## Quickstart
@@ -193,4 +186,4 @@ python scripts/bench_decode.py --include-fa3 \
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/Yifei-Zuo/Parallax/blob/main/LICENSE).
