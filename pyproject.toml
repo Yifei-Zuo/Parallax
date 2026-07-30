@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parallax-kernel"
+version = "0.1.1"
+description = "Parallax: Parameterized Local Linear Attention kernels (Triton, Helion, CuTeDSL). Imports as `parallax`."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Anonymous Authors" },
+]
+keywords = ["attention", "cutlass", "cute", "decode", "transformer"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Core deps cover the Triton training path and the Helion kernels. Kept
+# loose on purpose (floors = oldest tested stack): these paths use stable
+# torch/triton APIs and work on newer releases, e.g. inside a training env
+# that already ships its own torch. The version-sensitive path is the
+# cute-based SM90 decode / prefill stack, which lives behind the [cutedsl]
+# extra with strict pins.
+dependencies = [
+    "torch>=2.9",
+    "triton>=3.5",
+    "numpy",
+]
+
+[project.optional-dependencies]
+# Cute-based SM90 kernels (parallax_decode, parallax_prefill). Hopper only.
+# This is the version-sensitive stack: nvidia-cutlass-dsl 4.1.0 requires
+# CUDA-12 cuda-python and is validated against exactly this torch/triton
+# pair. It also vendors its libs; do NOT add libs-base (it unpins to 4.5.2
+# and overwrites the bundled libs with incompatible ones).
+cutedsl = [
+    "nvidia-cutlass-dsl==4.1.0",
+    "cuda-python>=12.8,<13",  # direct import (cuda.bindings); mirrors the cutlass-dsl constraint
+    "torch==2.9.1",
+    "triton==3.5.1",
+]
+# Helion kernels (compile to Triton; track the loose torch/triton deps above).
+helion = [
+    "helion>=1.2",  # tested against 1.2.0
+]
+
+# Repo-only workflows — installed from a checkout (uv sync --group ...), never
+# published to PyPI. The strict pins reproduce the exact stack the kernels and
+# the recorded benchmark numbers were validated on.
+[dependency-groups]
+# Parity tests: pytest + the [cutedsl] kernels + the Helion kernels. The tests
+# compare against the in-repo fp32 reference (no flash_attn needed).
+test = [
+    "pytest>=7",
+    "helion>=1.2",
+    "nvidia-cutlass-dsl==4.1.0",
+    "cuda-python>=12.8,<13",
+    "torch==2.9.1",
+    "triton==3.5.1",
+]
+# The bench harness additionally compares the decode kernel against FA2.
+bench = [
+    { include-group = "test" },
+    "psutil",
+    "rich>=13",
+    "flash_attn>=2.8.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["parallax*"]
+exclude = ["scripts*", "assets*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Deselect the exhaustive `stress` sweep by default (it JIT-compiles the
+# long-kv_len / large-split shapes that cost minutes each). Run it explicitly
+# with `pytest -m stress`.
+addopts = "-ra -m 'not stress'"
+markers = [
+    "sm90: test requires an SM90 (Hopper) GPU",
+    "stress: exhaustive shape sweep (slow to JIT-compile; opt-in via -m stress)",
+]
+
+[tool.uv]
+# flash_attn (FA2) imports torch in setup.py — disable build isolation so
+# its build env matches the runtime torch version.
+no-build-isolation-package = ["flash_attn"]
+# The pytorch wheel index needs this hint to resolve x86_64 wheels.
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
